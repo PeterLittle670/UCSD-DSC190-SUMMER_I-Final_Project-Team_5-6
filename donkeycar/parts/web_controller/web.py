@@ -121,6 +121,8 @@ class LocalWebController(tornado.web.Application):
         self.port = port
 
         self.num_records = 0
+        self.confidence = None            # last MC-Dropout confidence % (or None)
+        self.last_confidence_pct = None   # last value pushed to clients
         self.wsclients = []
         self.loop = None
 
@@ -162,12 +164,15 @@ class LocalWebController(tornado.web.Application):
                                    exc_info=e)
                     pass
 
-    def run_threaded(self, img_arr=None, num_records=0, mode=None, recording=None):
+    def run_threaded(self, img_arr=None, num_records=0, mode=None,
+                     recording=None, confidence=None):
         """
         :param img_arr: current camera image or None
         :param num_records: current number of data records
         :param mode: default user/mode
         :param recording: default recording mode
+        :param confidence: MC-Dropout confidence % (0-100) or None if the
+                           feature is disabled / the model is uncalibrated
         """
         self.img_arr = img_arr
         self.num_records = num_records
@@ -196,6 +201,15 @@ class LocalWebController(tornado.web.Application):
             if self.num_records % 10 == 0:
                 changes['num_records'] = self.num_records
 
+        # Push MC-Dropout confidence, but only when the whole-number percent
+        # changes, so we don't flood the socket every drive-loop frame.
+        self.confidence = confidence
+        if confidence is not None:
+            conf_pct = int(round(confidence))
+            if conf_pct != self.last_confidence_pct:
+                self.last_confidence_pct = conf_pct
+                changes['confidence'] = conf_pct
+
         #
         # get latched button presses then clear button presses
         # Next iteration will clear press in memory
@@ -213,8 +227,10 @@ class LocalWebController(tornado.web.Application):
 
         return self.angle, self.throttle, self.mode, self.recording, buttons
 
-    def run(self, img_arr=None, num_records=0, mode=None, recording=None):
-        return self.run_threaded(img_arr, num_records, mode, recording)
+    def run(self, img_arr=None, num_records=0, mode=None, recording=None,
+            confidence=None):
+        return self.run_threaded(img_arr, num_records, mode, recording,
+                                 confidence)
 
     def shutdown(self):
         pass

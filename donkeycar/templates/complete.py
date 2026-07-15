@@ -3,12 +3,13 @@
 Scripts to drive a donkey 2 car
 
 Usage:
-    manage.py (drive) [--model=<model>] [--js] [--type=(linear|categorical)] [--camera=(single|stereo)] [--meta=<key:value> ...] [--myconfig=<filename>]
+    manage.py (drive) [--model=<model>] [--js] [--type=(linear|categorical)] [--camera=(single|stereo)] [--meta=<key:value> ...] [--myconfig=<filename>] [--uncertainty]
     manage.py (train) [--tubs=tubs] (--model=<model>) [--type=(linear|inferred|tensorrt_linear|tflite_linear)]
 
 Options:
     -h --help               Show this screen.
     --js                    Use physical joystick.
+    --uncertainty           Estimate live steering uncertainty via MC-Dropout (linear model only).
     -f --file=<file>        A text file containing paths to tub files, one per line. Option may be used more than once.
     --meta=<key:value>      Key/Value strings describing describing a piece of meta data about this drive. Option may be used more than once.
     --myconfig=filename     Specify myconfig file to use. 
@@ -47,7 +48,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 def drive(cfg, model_path=None, use_joystick=False, model_type=None,
-          camera_type='single', meta=[]):
+          camera_type='single', meta=[], use_uncertainty=False):
     """
     Construct a working robotic vehicle from many parts. Each part runs as a
     job in the Vehicle loop, calling either it's run or run_threaded method
@@ -412,7 +413,61 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                   inputs=['cam/image_array'], outputs=['cam/image_array_trans'])
             inputs = ['cam/image_array_trans'] + inputs[1:]
 
-        V.add(kl, inputs=inputs, outputs=outputs, run_condition='run_pilot')
+        #
+        # Optionally wrap the pilot in an MC-Dropout uncertainty estimator.
+        # This runs the model N times per frame with dropout active and emits
+        # the variance of the steering predictions as an uncertainty signal.
+        # Linear model only; the averaged prediction is the driving command.
+        #
+        if use_uncertainty:
+            from donkeycar.parts.mc_dropout import MCDropoutConfidence
+            from donkeycar.parts.mc_calibrate import default_calib_path
+            n_passes = getattr(cfg, 'MC_DROPOUT_PASSES', 15)
+            alpha = getattr(cfg, 'MC_DROPOUT_ALPHA', 0.2)
+            # Look for a calibration file next to the model so the dashboard
+            # can show a confidence %. Absent -> variance still logged, but
+            # confidence displays as "not calibrated".
+            calib_path = default_calib_path(model_path)
+            if not os.path.exists(calib_path):
+                logger.warning(f"No calibration found at {calib_path}; run "
+                               f"'python -m donkeycar.parts.mc_calibrate' to "
+                               f"enable the confidence %. Variance still logged.")
+                calib_path = None
+            logger.info(f"Enabling MC-Dropout uncertainty (N={n_passes}, "
+                        f"alpha={alpha})")
+            mc_pilot = MCDropoutConfidence(kl, num_passes=n_passes, alpha=alpha,
+                                           calibration_path=calib_path)
+            V.add(mc_pilot, inputs=inputs,
+                  outputs=outputs + ['pilot/confidence',
+                                     'pilot/raw_variance',
+                                     'pilot/smoothed_variance'],
+                  run_condition='run_pilot')
+
+            #
+            # Feature 2: optionally scale throttle down as confidence drops.
+            # Only reduces throttle, never touches steering. Needs the
+            # confidence signal above, so it lives inside this branch.
+            #
+            if getattr(cfg, 'USE_CONFIDENCE_THROTTLE_SCALING', False):
+                from donkeycar.parts.mc_dropout import ConfidenceThrottleScaler
+                logger.info("Enabling confidence-based throttle scaling")
+                throttle_scaler = ConfidenceThrottleScaler(
+                    reduced_threshold=getattr(cfg, 'CONFIDENCE_REDUCED_THRESHOLD', 65.0),
+                    critical_threshold=getattr(cfg, 'CONFIDENCE_CRITICAL_THRESHOLD', 25.0),
+                    min_scale=getattr(cfg, 'CONFIDENCE_THROTTLE_MIN_SCALE', 0.4),
+                    stop_duration=getattr(cfg, 'CONFIDENCE_STOP_DURATION', 1.0))
+                V.add(throttle_scaler,
+                      inputs=['pilot/throttle', 'pilot/confidence'],
+                      outputs=['pilot/throttle'],
+                      run_condition='run_pilot')
+        else:
+            if getattr(cfg, 'USE_CONFIDENCE_THROTTLE_SCALING', False):
+                logger.warning("USE_CONFIDENCE_THROTTLE_SCALING is set but "
+                               "--uncertainty was not passed; throttle scaling "
+                               "needs the confidence signal and will be "
+                               "inactive.")
+            V.add(kl, inputs=inputs, outputs=outputs,
+                  run_condition='run_pilot')
 
     #
     # stop at a stop sign
@@ -693,7 +748,8 @@ def add_user_controller(V, cfg, use_joystick, input_image='ui/image_array'):
     #
     ctr = LocalWebController(port=cfg.WEB_CONTROL_PORT, mode=cfg.WEB_INIT_MODE)
     V.add(ctr,
-          inputs=[input_image, 'tub/num_records', 'user/mode', 'recording'],
+          inputs=[input_image, 'tub/num_records', 'user/mode', 'recording',
+                  'pilot/confidence'],
           outputs=['user/steering', 'user/throttle', 'user/mode', 'recording', 'web/buttons'],
           threaded=True)
 
@@ -1154,6 +1210,6 @@ if __name__ == '__main__':
         camera_type = args['--camera']
         drive(cfg, model_path=args['--model'], use_joystick=args['--js'],
               model_type=model_type, camera_type=camera_type,
-              meta=args['--meta'])
+              meta=args['--meta'], use_uncertainty=args['--uncertainty'])
     elif args['train']:
         print('Use python train.py instead.\n')

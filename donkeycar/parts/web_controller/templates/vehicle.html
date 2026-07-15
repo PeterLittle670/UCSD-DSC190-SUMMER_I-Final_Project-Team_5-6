@@ -60,6 +60,22 @@
             </div>
           </div>
         </div>
+
+        <!-- model confidence (MC-Dropout), only shown when --uncertainty is on -->
+        <div id="confidence-panel" class="panel panel-default" style="display: none;">
+          <div class="panel-body">
+            <span class="group-label">Model confidence</span>
+            <span id="confidence-value" class="pull-right">&mdash;</span>
+            <div class="progress" id="confidence-progress">
+              <div id="confidence-bar" class="progress-bar progress-bar-success"
+                   role="progressbar" style="width: 0%;"></div>
+            </div>
+            <small class="text-muted">
+              MC-Dropout uncertainty &mdash; relative to this model's baseline,
+              not a calibrated probability.
+            </small>
+          </div>
+        </div>
       </div> <!-- end video column -->
 
       <div id="joystick-column"  class="col-md-6">

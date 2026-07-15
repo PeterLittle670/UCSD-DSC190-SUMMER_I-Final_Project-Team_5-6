@@ -494,6 +494,31 @@ LEARNING_RATE_DECAY = 0.0
 # Store images as 'ARRAY' (faster), 'BINARY', or 'NOCACHE' (saves RAM).
 CACHE_POLICY = 'ARRAY'
 
+# MC-DROPOUT UNCERTAINTY (enabled at drive time with the --uncertainty flag).
+# Runs the linear model N times per frame with dropout active and reports the
+# variance of the steering predictions as a relative uncertainty signal.
+# NOTE: this is a relative, per-model signal, NOT a calibrated probability.
+# Higher N = smoother estimate but more compute per frame; re-check timing on
+# your target hardware (a Pi is much slower than a desktop).
+MC_DROPOUT_PASSES = 15      # number of stochastic forward passes per frame
+MC_DROPOUT_ALPHA = 0.2      # EMA smoothing of the variance (0..1, higher=faster)
+# When True, training automatically builds the confidence calibration on the
+# training tubs and saves <model>.calib.json next to the model, so the model
+# ships ready for the --uncertainty dashboard. Adds a replay pass (~minutes),
+# so it is off by default. Linear model only.
+MC_DROPOUT_AUTO_CALIBRATE = False
+MC_DROPOUT_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
+
+# CONFIDENCE-BASED THROTTLE SCALING (Feature 2). Requires the --uncertainty
+# flag (it consumes the confidence signal). When enabled, the autopilot
+# throttle is scaled down as confidence drops; steering is never affected, and
+# manual driving is unchanged. Disabled -> zero behaviour change.
+USE_CONFIDENCE_THROTTLE_SCALING = False
+CONFIDENCE_REDUCED_THRESHOLD = 65.0    # below this confidence %, start scaling
+CONFIDENCE_CRITICAL_THRESHOLD = 25.0   # below this confidence %, critical tier
+CONFIDENCE_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from this signal
+CONFIDENCE_STOP_DURATION = 1.0         # secs sustained-critical before full stop
+
 # MODEL OPTIMIZATION
 # Automatically create TFLite model for faster inference on Pi.
 CREATE_TF_LITE = True

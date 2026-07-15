@@ -17,6 +17,7 @@ var driveHandler = new function() {
         'driveMode': "user",
         'pilot': 'None',
         'session': 'None',
+        'confidence': null,   // MC-Dropout confidence %, null when disabled
         'lag': 0,
         'controlMode': 'joystick',
         'maxThrottle' : 1,
@@ -231,6 +232,21 @@ var driveHandler = new function() {
 
       $('#throttle_label').html(throttleRounded);
       $('#steering_label').html(steeringRounded);
+
+      // MC-Dropout model confidence meter (only present when --uncertainty is on)
+      if (state.confidence !== null && state.confidence !== undefined) {
+        var conf = Math.max(0, Math.min(100, Math.round(state.confidence)));
+        // Tiers mirror the calibration anchors: normal / reduced / critical.
+        var confClass = conf >= 65 ? 'progress-bar-success'
+                      : conf >= 25 ? 'progress-bar-warning'
+                      : 'progress-bar-danger';
+        $('#confidence-panel').show();
+        $('#confidence-value').html(conf + '%');
+        $('#confidence-bar')
+          .css('width', conf + '%')
+          .removeClass('progress-bar-success progress-bar-warning progress-bar-danger')
+          .addClass(confClass);
+      }
 
       if(state.tele.user.throttle < 0) {
         $('#throttle-bar-backward').css('width', throttlePercent).html(throttleRounded)

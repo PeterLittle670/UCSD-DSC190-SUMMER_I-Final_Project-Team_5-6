@@ -199,4 +199,29 @@ def train(cfg: Config, tub_paths: str, model: str = None,
     database.add_entry(database_entry)
     database.write()
 
+    # Optionally build the MC-Dropout confidence calibration on the training
+    # tubs, so the trained model ships with a <model>.calib.json (saved next to
+    # the model) that the --uncertainty dashboard uses to show a confidence %.
+    # Off by default because it adds a replay pass over the data; enable with
+    # MC_DROPOUT_AUTO_CALIBRATE = True. Linear model only (MC-Dropout relies on
+    # the dropout layers in the default linear architecture).
+    if getattr(cfg, 'MC_DROPOUT_AUTO_CALIBRATE', False):
+        if model_type == 'linear':
+            try:
+                from donkeycar.parts.mc_calibrate import calibrate_from_tub
+                calib_tubs = [os.path.expanduser(t)
+                              for t in tub_paths.split(',')]
+                limit = getattr(cfg, 'MC_DROPOUT_CALIBRATE_LIMIT', None)
+                logger.info('Building MC-Dropout confidence calibration on '
+                            'the training tubs...')
+                _, calib_path = calibrate_from_tub(
+                    cfg, calib_tubs, model_path, limit=limit)
+                logger.info(f'Saved MC-Dropout calibration to {calib_path}')
+            except Exception as e:
+                logger.warning(f'MC-Dropout auto-calibration failed '
+                               f'(model still trained fine): {e}')
+        else:
+            logger.info(f'Skipping MC-Dropout calibration: only supported for '
+                        f'the linear model, not "{model_type}".')
+
     return history
