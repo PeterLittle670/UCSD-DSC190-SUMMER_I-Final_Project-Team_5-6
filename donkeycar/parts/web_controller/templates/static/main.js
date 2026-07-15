@@ -95,7 +95,7 @@ var driveHandler = new function() {
                 // we are only updating existing fields.
                 //
                 if(state.hasOwnProperty(key) && state[key] !== data[key]) {
-                    if(typeof state[key] === 'object') {
+                    if(state[key] !== null && typeof state[key] === 'object') {
                         // recursively update the state's object field
                         changed = updateState(state[key], data[key]) && changed;
                     } else {
