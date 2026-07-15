@@ -60,11 +60,22 @@ class MCDropoutConfidence:
                         ``donkeycar.parts.mc_calibrate``. Optional.
     """
 
-    def __init__(self, pilot, num_passes=15, alpha=0.2, calibration_path=None):
+    def __init__(self, pilot, num_passes=15, alpha=0.2, calibration_path=None,
+                 interval=0.0):
         self.pilot = pilot
         self.num_passes = int(num_passes)
         self.alpha = float(alpha)
         self.smoothed_variance = None  # lazily initialised on first frame
+
+        # Minimum seconds between stochastic (N-pass) uncertainty updates.
+        # 0 = update every frame. Between updates, a cheap single
+        # deterministic pass still produces a fresh steering command each
+        # loop iteration; only the uncertainty numbers are held.
+        # NOTE: the EMA alpha applies per *update*, so with a longer interval
+        # the variance is smoothed over fewer, more spaced-out samples.
+        self.interval = float(interval)
+        self.last_mc_time = None
+        self.raw_variance = 0.0
 
         # Optional calibration: maps smoothed variance -> displayed confidence %.
         # Without it, the part still emits variance but confidence is None.
@@ -152,12 +163,23 @@ class MCDropoutConfidence:
             return 0.0, 0.0, self._confidence(), 0.0, \
                 (self.smoothed_variance or 0.0)
 
+        # Rate limiting: between uncertainty updates, drive on a cheap single
+        # deterministic pass and hold the last uncertainty values.
+        now = time.time()
+        if (self.interval > 0 and self.last_mc_time is not None
+                and (now - self.last_mc_time) < self.interval):
+            angle, throttle = self.pilot.run(img_arr, *other_arr)
+            return (float(angle), float(throttle), self._confidence(),
+                    self.raw_variance, (self.smoothed_variance or 0.0))
+        self.last_mc_time = now
+
         angle_samples, throttle_samples = \
             self._stochastic_forward(img_arr, other_arr)
 
         mean_steering = float(np.mean(angle_samples))
         mean_throttle = float(np.mean(throttle_samples))
         raw_variance = float(np.var(angle_samples))
+        self.raw_variance = raw_variance
 
         # Exponential moving average of the variance.
         if self.smoothed_variance is None:

@@ -502,6 +502,12 @@ CACHE_POLICY = 'ARRAY'
 # your target hardware (a Pi is much slower than a desktop).
 MC_DROPOUT_PASSES = 15      # number of stochastic forward passes per frame
 MC_DROPOUT_ALPHA = 0.2      # EMA smoothing of the variance (0..1, higher=faster)
+# Minimum seconds between uncertainty updates. 0 = every frame (default).
+# E.g. 0.15 updates the confidence ~6-7x/sec; between updates the car still
+# steers every frame via a cheap single-pass inference, only the uncertainty
+# numbers are held. Reduces average compute load on slow hardware (Pi), at
+# the cost of a periodic slower loop iteration when the N-pass update runs.
+MC_DROPOUT_INTERVAL = 0.0
 # When True, training automatically builds the confidence calibration on the
 # training tubs and saves <model>.calib.json next to the model, so the model
 # ships ready for the --uncertainty dashboard. Adds a replay pass (~minutes),

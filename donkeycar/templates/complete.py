@@ -424,6 +424,7 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
             from donkeycar.parts.mc_calibrate import default_calib_path
             n_passes = getattr(cfg, 'MC_DROPOUT_PASSES', 15)
             alpha = getattr(cfg, 'MC_DROPOUT_ALPHA', 0.2)
+            mc_interval = getattr(cfg, 'MC_DROPOUT_INTERVAL', 0.0)
             # Look for a calibration file next to the model so the dashboard
             # can show a confidence %. Absent -> variance still logged, but
             # confidence displays as "not calibrated".
@@ -436,7 +437,8 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
             logger.info(f"Enabling MC-Dropout uncertainty (N={n_passes}, "
                         f"alpha={alpha})")
             mc_pilot = MCDropoutConfidence(kl, num_passes=n_passes, alpha=alpha,
-                                           calibration_path=calib_path)
+                                           calibration_path=calib_path,
+                                           interval=mc_interval)
             V.add(mc_pilot, inputs=inputs,
                   outputs=outputs + ['pilot/confidence',
                                      'pilot/raw_variance',
@@ -577,6 +579,14 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
     if cfg.RECORD_DURING_AI:
         inputs += ['pilot/angle', 'pilot/throttle']
         types += ['float', 'float']
+
+    # Log the MC-Dropout uncertainty signal with each frame; this is the
+    # input for the offline Grad-CAM analysis tool. Values are None (and thus
+    # skipped by the tub) whenever the pilot isn't running.
+    if use_uncertainty:
+        inputs += ['pilot/confidence', 'pilot/raw_variance',
+                   'pilot/smoothed_variance']
+        types += ['float', 'float', 'float']
 
     if cfg.HAVE_PERFMON:
         from donkeycar.parts.perfmon import PerfMonitor
