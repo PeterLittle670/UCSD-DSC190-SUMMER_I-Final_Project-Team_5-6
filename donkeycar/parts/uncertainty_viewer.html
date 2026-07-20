@@ -78,6 +78,8 @@
         <select id="layer">
           <option value="overlay" selected>uncertainty overlay</option>
           <option value="attention">mean attention</option>
+          <option value="novelty">novelty (OOD)</option>
+          <option value="saliency">saliency (pixel gradient)</option>
           <option value="orig">camera only</option>
         </select>
       </label>
@@ -152,8 +154,13 @@
     const f = data.frames && data.frames[String(entry.index)];
     if (f) {
       const layer = layerSel.value;
-      return layer === 'attention' ? f.attention :
-             layer === 'orig' ? f.orig : f.overlay;
+      if (layer === 'attention') return f.attention;
+      if (layer === 'orig') return f.orig;
+      // novelty map may be absent even on an analysed frame if the model's
+      // calibration predates novelty stats -- fall through to unavailable.
+      if (layer === 'novelty') return f.novelty || null;
+      if (layer === 'saliency') return f.saliency || null;
+      return f.overlay;
     }
     if (entry.image) return entry.image;          // exported frames/
     if (entry.tub_image) return 'tub/' + entry.tub_image;
@@ -172,6 +179,8 @@
 
     if (f) {
       if (layerSel.value === 'orig') showBadge('analysed · overlays hidden');
+      else if (layerSel.value === 'novelty' && !f.novelty)
+        showBadge('no novelty map for this frame (model has no novelty calibration)');
       else badge.hidden = true;
     } else {
       showBadge('no uncertainty map for this frame');
@@ -184,6 +193,8 @@
               's · variance ' + (entry.variance || 0).toFixed(5);
     if (entry.confidence !== null && entry.confidence !== undefined)
       txt += ' · confidence <b>' + Math.round(entry.confidence) + '%</b>';
+    if (entry.novelty_score !== null && entry.novelty_score !== undefined)
+      txt += ' · novelty <b>' + Math.round(entry.novelty_score) + '%</b>';
     readout.innerHTML = txt;
     drawGraph();
   }

@@ -196,81 +196,134 @@ class MCDropoutConfidence:
         pass
 
 
-class ConfidenceThrottleScaler:
+class ThrottleScaler:
     """
-    Feature 2: scale the pilot throttle down when the MC-Dropout confidence
-    drops. The philosophy is "hesitate, don't guess": this only ever reduces
-    throttle magnitude and NEVER touches steering.
+    Feature 2: scale the pilot throttle down as MC-Dropout confidence drops
+    and/or feature-space novelty rises. The philosophy is "hesitate, don't
+    guess": this only ever reduces throttle magnitude and NEVER touches
+    steering.
 
-    Behaviour (all thresholds configurable):
-      * confidence >= reduced_threshold  -> full throttle, unchanged.
-      * critical_threshold <= confidence < reduced_threshold -> "reduced" tier:
-        throttle is linearly scaled from full (at reduced_threshold) down to
-        ``min_scale`` (at critical_threshold). It never drops below
-        ``min_scale`` from this signal alone.
-      * confidence < critical_threshold -> "critical" tier: throttle held at
-        ``min_scale``, and if the critical tier is *sustained* for
-        ``stop_duration`` seconds, throttle is forced to zero (stop).
+    Each signal has its own reduced/critical thresholds (confidence is a
+    "high is good" signal, novelty a "high is bad" one -- see
+    ``donkeycar.parts.novelty`` for why these are complementary, not
+    redundant). On any frame, each available signal is converted to a scale
+    in ``[min_scale, 1.0]`` independently, and the **lower** (more
+    conservative) of the two is applied -- so a problem flagged by either
+    signal alone is enough to ease off the throttle, matching the intent
+    that either failure mode (model disagreement, or a genuinely unfamiliar
+    scene) warrants caution. A signal that's unavailable (feature disabled
+    upstream, or model uncalibrated) is simply excluded from the
+    comparison -- enabling only one of the two signals still works,
+    scaling on that signal alone.
+
+    Per-signal tiers (mirrored between the two, thresholds configurable):
+      * confidence >= confidence_reduced_threshold, or
+        novelty <= novelty_reduced_threshold -> that signal contributes full
+        scale (1.0), unchanged.
+      * between its reduced/critical thresholds -> that signal's scale is
+        linearly interpolated between 1.0 and ``min_scale``.
+      * confidence < confidence_critical_threshold, or
+        novelty > novelty_critical_threshold -> that signal is "critical":
+        contributes ``min_scale``, and if *any* signal has been
+        continuously critical for ``stop_duration`` seconds, throttle is
+        forced to zero (stop).
 
     Passthrough (no change to throttle) when:
-      * confidence is None (feature disabled upstream / model uncalibrated), or
-      * throttle is None.
+      * throttle is None, or
+      * both confidence and novelty are None (nothing to act on).
 
     Run signature::
 
-        scaled_throttle = part.run(throttle, confidence)
+        scaled_throttle = part.run(throttle, confidence, novelty)
 
     Intended to be added with ``run_condition='run_pilot'`` so it only affects
     autopilot throttle, giving zero behaviour change to manual driving.
     """
 
-    def __init__(self, reduced_threshold=65.0, critical_threshold=25.0,
+    def __init__(self, confidence_reduced_threshold=65.0,
+                 confidence_critical_threshold=25.0,
+                 novelty_reduced_threshold=25.0,
+                 novelty_critical_threshold=65.0,
                  min_scale=0.4, stop_duration=1.0):
-        self.reduced_threshold = float(reduced_threshold)
-        self.critical_threshold = float(critical_threshold)
+        self.confidence_reduced_threshold = float(confidence_reduced_threshold)
+        self.confidence_critical_threshold = float(confidence_critical_threshold)
+        self.novelty_reduced_threshold = float(novelty_reduced_threshold)
+        self.novelty_critical_threshold = float(novelty_critical_threshold)
         self.min_scale = float(min_scale)
         self.stop_duration = float(stop_duration)
         self.critical_since = None   # timestamp critical tier began, else None
-        self._warned_no_conf = False
-        logger.info(f'ConfidenceThrottleScaler: reduced<{reduced_threshold}%, '
-                    f'critical<{critical_threshold}%, min_scale={min_scale}, '
+        self._warned_no_signal = False
+        logger.info(f'ThrottleScaler: confidence reduced<'
+                    f'{confidence_reduced_threshold}% critical<'
+                    f'{confidence_critical_threshold}%, novelty reduced>'
+                    f'{novelty_reduced_threshold}% critical>'
+                    f'{novelty_critical_threshold}%, min_scale={min_scale}, '
                     f'stop_after={stop_duration}s')
 
-    def run(self, throttle, confidence):
+    def _signal_scale(self, value, reduced_threshold, critical_threshold,
+                      ascending):
+        """
+        Convert one signal's raw value to (scale, is_critical). `ascending`
+        selects the "high is bad" (novelty) direction vs "high is good"
+        (confidence) direction. Returns (None, False) if value is None.
+        """
+        if value is None:
+            return None, False
+        if ascending:
+            if value <= reduced_threshold:
+                return 1.0, False
+            if value <= critical_threshold:
+                span = critical_threshold - reduced_threshold
+                frac = (value - reduced_threshold) / span if span > 0 else 0.0
+                return 1.0 - (1.0 - self.min_scale) * frac, False
+            return self.min_scale, True
+        else:
+            if value >= reduced_threshold:
+                return 1.0, False
+            if value >= critical_threshold:
+                span = reduced_threshold - critical_threshold
+                frac = (value - critical_threshold) / span if span > 0 else 0.0
+                return self.min_scale + (1.0 - self.min_scale) * frac, False
+            return self.min_scale, True
+
+    def run(self, throttle, confidence, novelty):
         if throttle is None:
             return throttle
-        if confidence is None:
+
+        conf_scale, conf_critical = self._signal_scale(
+            confidence, self.confidence_reduced_threshold,
+            self.confidence_critical_threshold, ascending=False)
+        nov_scale, nov_critical = self._signal_scale(
+            novelty, self.novelty_reduced_threshold,
+            self.novelty_critical_threshold, ascending=True)
+
+        scales = [s for s in (conf_scale, nov_scale) if s is not None]
+        if not scales:
             # No usable signal -> do not interfere with driving.
-            if not self._warned_no_conf:
-                logger.warning('ConfidenceThrottleScaler: confidence is None '
-                               '(is --uncertainty on and the model '
+            if not self._warned_no_signal:
+                logger.warning('ThrottleScaler: neither confidence nor '
+                               'novelty is available (is '
+                               'USE_MC_DROPOUT_CONFIDENCE/'
+                               'USE_NOVELTY_DETECTION on, and the model '
                                'calibrated?); throttle passed through '
                                'unchanged.')
-                self._warned_no_conf = True
+                self._warned_no_signal = True
             self.critical_since = None
             return throttle
 
-        # Normal tier: full throttle.
-        if confidence >= self.reduced_threshold:
-            self.critical_since = None
-            return throttle
+        scale = min(scales)
+        any_critical = conf_critical or nov_critical
 
-        # Reduced tier: linearly interpolate scale from 1.0 down to min_scale.
-        if confidence >= self.critical_threshold:
+        if any_critical:
+            now = time.time()
+            if self.critical_since is None:
+                self.critical_since = now
+            if now - self.critical_since >= self.stop_duration:
+                return 0.0
+        else:
             self.critical_since = None
-            span = self.reduced_threshold - self.critical_threshold
-            frac = (confidence - self.critical_threshold) / span if span > 0 \
-                else 0.0
-            scale = self.min_scale + (1.0 - self.min_scale) * frac
-            return throttle * scale
 
-        # Critical tier: hold at min_scale, and force a stop if sustained.
-        now = time.time()
-        if self.critical_since is None:
-            self.critical_since = now
-        if now - self.critical_since >= self.stop_duration:
-            return 0.0
-        return throttle * self.min_scale
+        return throttle * scale
 
     def shutdown(self):
         pass

@@ -3,13 +3,12 @@
 Scripts to drive a donkey 2 car
 
 Usage:
-    manage.py (drive) [--model=<model>] [--js] [--type=(linear|categorical)] [--camera=(single|stereo)] [--meta=<key:value> ...] [--myconfig=<filename>] [--uncertainty]
+    manage.py (drive) [--model=<model>] [--js] [--type=(linear|categorical)] [--camera=(single|stereo)] [--meta=<key:value> ...] [--myconfig=<filename>]
     manage.py (train) [--tubs=tubs] (--model=<model>) [--type=(linear|inferred|tensorrt_linear|tflite_linear)]
 
 Options:
     -h --help               Show this screen.
     --js                    Use physical joystick.
-    --uncertainty           Estimate live steering uncertainty via MC-Dropout (linear model only).
     -f --file=<file>        A text file containing paths to tub files, one per line. Option may be used more than once.
     --meta=<key:value>      Key/Value strings describing describing a piece of meta data about this drive. Option may be used more than once.
     --myconfig=filename     Specify myconfig file to use. 
@@ -48,7 +47,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 def drive(cfg, model_path=None, use_joystick=False, model_type=None,
-          camera_type='single', meta=[], use_uncertainty=False):
+          camera_type='single', meta=[]):
     """
     Construct a working robotic vehicle from many parts. Each part runs as a
     job in the Vehicle loop, calling either it's run or run_threaded method
@@ -414,12 +413,15 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
             inputs = ['cam/image_array_trans'] + inputs[1:]
 
         #
-        # Optionally wrap the pilot in an MC-Dropout uncertainty estimator.
-        # This runs the model N times per frame with dropout active and emits
-        # the variance of the steering predictions as an uncertainty signal.
-        # Linear model only; the averaged prediction is the driving command.
+        # MC-Dropout confidence signal: runs the model N times per frame with
+        # dropout active and emits the variance of the steering predictions
+        # as an uncertainty signal. Linear model only; the averaged
+        # prediction is the driving command. Toggled independently of
+        # novelty detection below -- each is its own config flag, and each
+        # works with or without the other.
         #
-        if use_uncertainty:
+        use_mc_dropout = getattr(cfg, 'USE_MC_DROPOUT_CONFIDENCE', False)
+        if use_mc_dropout:
             from donkeycar.parts.mc_dropout import MCDropoutConfidence
             from donkeycar.parts.mc_calibrate import default_calib_path
             n_passes = getattr(cfg, 'MC_DROPOUT_PASSES', 15)
@@ -434,7 +436,7 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                                f"'python -m donkeycar.parts.mc_calibrate' to "
                                f"enable the confidence %. Variance still logged.")
                 calib_path = None
-            logger.info(f"Enabling MC-Dropout uncertainty (N={n_passes}, "
+            logger.info(f"Enabling MC-Dropout confidence (N={n_passes}, "
                         f"alpha={alpha})")
             mc_pilot = MCDropoutConfidence(kl, num_passes=n_passes, alpha=alpha,
                                            calibration_path=calib_path,
@@ -444,31 +446,63 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                                      'pilot/raw_variance',
                                      'pilot/smoothed_variance'],
                   run_condition='run_pilot')
-
-            #
-            # Feature 2: optionally scale throttle down as confidence drops.
-            # Only reduces throttle, never touches steering. Needs the
-            # confidence signal above, so it lives inside this branch.
-            #
-            if getattr(cfg, 'USE_CONFIDENCE_THROTTLE_SCALING', False):
-                from donkeycar.parts.mc_dropout import ConfidenceThrottleScaler
-                logger.info("Enabling confidence-based throttle scaling")
-                throttle_scaler = ConfidenceThrottleScaler(
-                    reduced_threshold=getattr(cfg, 'CONFIDENCE_REDUCED_THRESHOLD', 65.0),
-                    critical_threshold=getattr(cfg, 'CONFIDENCE_CRITICAL_THRESHOLD', 25.0),
-                    min_scale=getattr(cfg, 'CONFIDENCE_THROTTLE_MIN_SCALE', 0.4),
-                    stop_duration=getattr(cfg, 'CONFIDENCE_STOP_DURATION', 1.0))
-                V.add(throttle_scaler,
-                      inputs=['pilot/throttle', 'pilot/confidence'],
-                      outputs=['pilot/throttle'],
-                      run_condition='run_pilot')
         else:
-            if getattr(cfg, 'USE_CONFIDENCE_THROTTLE_SCALING', False):
-                logger.warning("USE_CONFIDENCE_THROTTLE_SCALING is set but "
-                               "--uncertainty was not passed; throttle scaling "
-                               "needs the confidence signal and will be "
-                               "inactive.")
             V.add(kl, inputs=inputs, outputs=outputs,
+                  run_condition='run_pilot')
+
+        #
+        # Feature-space novelty (out-of-distribution) detection. Independent
+        # of USE_MC_DROPOUT_CONFIDENCE: it's a single cheap deterministic
+        # pass, so it shouldn't force the N-pass MC-Dropout cost onto someone
+        # who only wants OOD detection. Rides alongside whichever part drives
+        # above (mc_pilot or kl) as a pure auxiliary observer -- it never
+        # produces steering/throttle.
+        #
+        use_novelty = getattr(cfg, 'USE_NOVELTY_DETECTION', False)
+        if use_novelty:
+            from donkeycar.parts.novelty import FeatureNoveltyDetector
+            from donkeycar.parts.mc_calibrate import default_calib_path
+            novelty_calib_path = default_calib_path(model_path)
+            if not os.path.exists(novelty_calib_path):
+                logger.warning(f"No calibration found at {novelty_calib_path}; "
+                               f"run 'python -m donkeycar.parts.mc_calibrate' "
+                               f"to enable novelty detection.")
+                novelty_calib_path = None
+            logger.info("Enabling feature-space novelty detection")
+            novelty_part = FeatureNoveltyDetector(
+                kl, calibration_path=novelty_calib_path,
+                alpha=getattr(cfg, 'NOVELTY_EMA_ALPHA', 0.2))
+            V.add(novelty_part, inputs=[inputs[0]],
+                  outputs=['pilot/novelty', 'pilot/raw_novelty_distance',
+                           'pilot/smoothed_novelty_distance'],
+                  run_condition='run_pilot')
+
+        #
+        # Feature 2: scale throttle down as confidence drops and/or novelty
+        # rises. Only reduces throttle, never touches steering. Takes the
+        # more conservative (lowest) scale across whichever signal(s) are
+        # currently enabled and calibrated; a disabled or uncalibrated
+        # signal is ignored rather than blocking the other one.
+        #
+        if getattr(cfg, 'USE_THROTTLE_SCALING', False):
+            if not use_mc_dropout and not use_novelty:
+                logger.warning("USE_THROTTLE_SCALING is set but neither "
+                               "USE_MC_DROPOUT_CONFIDENCE nor "
+                               "USE_NOVELTY_DETECTION is enabled; throttle "
+                               "scaling has no signal to act on and will be "
+                               "inactive.")
+            from donkeycar.parts.mc_dropout import ThrottleScaler
+            logger.info("Enabling confidence/novelty-based throttle scaling")
+            throttle_scaler = ThrottleScaler(
+                confidence_reduced_threshold=getattr(cfg, 'CONFIDENCE_REDUCED_THRESHOLD', 65.0),
+                confidence_critical_threshold=getattr(cfg, 'CONFIDENCE_CRITICAL_THRESHOLD', 25.0),
+                novelty_reduced_threshold=getattr(cfg, 'NOVELTY_REDUCED_THRESHOLD', 25.0),
+                novelty_critical_threshold=getattr(cfg, 'NOVELTY_CRITICAL_THRESHOLD', 65.0),
+                min_scale=getattr(cfg, 'CONFIDENCE_THROTTLE_MIN_SCALE', 0.4),
+                stop_duration=getattr(cfg, 'CONFIDENCE_STOP_DURATION', 1.0))
+            V.add(throttle_scaler,
+                  inputs=['pilot/throttle', 'pilot/confidence', 'pilot/novelty'],
+                  outputs=['pilot/throttle'],
                   run_condition='run_pilot')
 
     #
@@ -580,12 +614,19 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         inputs += ['pilot/angle', 'pilot/throttle']
         types += ['float', 'float']
 
-    # Log the MC-Dropout uncertainty signal with each frame; this is the
+    # Log the MC-Dropout confidence signal with each frame; this is the
     # input for the offline Grad-CAM analysis tool. Values are None (and thus
     # skipped by the tub) whenever the pilot isn't running.
-    if use_uncertainty:
+    if getattr(cfg, 'USE_MC_DROPOUT_CONFIDENCE', False):
         inputs += ['pilot/confidence', 'pilot/raw_variance',
                    'pilot/smoothed_variance']
+        types += ['float', 'float', 'float']
+
+    # Log the novelty (out-of-distribution) signal too, independent of
+    # USE_MC_DROPOUT_CONFIDENCE -- input for the offline Grad-CAM analysis tool.
+    if getattr(cfg, 'USE_NOVELTY_DETECTION', False):
+        inputs += ['pilot/novelty', 'pilot/raw_novelty_distance',
+                   'pilot/smoothed_novelty_distance']
         types += ['float', 'float', 'float']
 
     if cfg.HAVE_PERFMON:
@@ -759,7 +800,7 @@ def add_user_controller(V, cfg, use_joystick, input_image='ui/image_array'):
     ctr = LocalWebController(port=cfg.WEB_CONTROL_PORT, mode=cfg.WEB_INIT_MODE)
     V.add(ctr,
           inputs=[input_image, 'tub/num_records', 'user/mode', 'recording',
-                  'pilot/confidence'],
+                  'pilot/confidence', 'pilot/novelty'],
           outputs=['user/steering', 'user/throttle', 'user/mode', 'recording', 'web/buttons'],
           threaded=True)
 
@@ -1220,6 +1261,6 @@ if __name__ == '__main__':
         camera_type = args['--camera']
         drive(cfg, model_path=args['--model'], use_joystick=args['--js'],
               model_type=model_type, camera_type=camera_type,
-              meta=args['--meta'], use_uncertainty=args['--uncertainty'])
+              meta=args['--meta'])
     elif args['train']:
         print('Use python train.py instead.\n')

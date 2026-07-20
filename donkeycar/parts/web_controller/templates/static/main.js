@@ -18,6 +18,7 @@ var driveHandler = new function() {
         'pilot': 'None',
         'session': 'None',
         'confidence': null,   // MC-Dropout confidence %, null when disabled
+        'novelty': null,      // feature-space novelty (OOD) %, null when disabled
         'lag': 0,
         'controlMode': 'joystick',
         'maxThrottle' : 1,
@@ -233,7 +234,7 @@ var driveHandler = new function() {
       $('#throttle_label').html(throttleRounded);
       $('#steering_label').html(steeringRounded);
 
-      // MC-Dropout model confidence meter (only present when --uncertainty is on)
+      // MC-Dropout model confidence meter (only present when USE_MC_DROPOUT_CONFIDENCE is on)
       if (state.confidence !== null && state.confidence !== undefined) {
         var conf = Math.max(0, Math.min(100, Math.round(state.confidence)));
         // Tiers mirror the calibration anchors: normal / reduced / critical.
@@ -246,6 +247,22 @@ var driveHandler = new function() {
           .css('width', conf + '%')
           .removeClass('progress-bar-success progress-bar-warning progress-bar-danger')
           .addClass(confClass);
+      }
+
+      // Feature-space novelty (OOD) meter (only present when
+      // USE_NOVELTY_DETECTION is on). Tier colors are INVERTED from
+      // confidence: low novelty (familiar) = green, high (unfamiliar) = red.
+      if (state.novelty !== null && state.novelty !== undefined) {
+        var nov = Math.max(0, Math.min(100, Math.round(state.novelty)));
+        var novClass = nov <= 25 ? 'progress-bar-success'
+                     : nov <= 65 ? 'progress-bar-warning'
+                     : 'progress-bar-danger';
+        $('#novelty-panel').show();
+        $('#novelty-value').html(nov + '%');
+        $('#novelty-bar')
+          .css('width', nov + '%')
+          .removeClass('progress-bar-success progress-bar-warning progress-bar-danger')
+          .addClass(novClass);
       }
 
       if(state.tele.user.throttle < 0) {

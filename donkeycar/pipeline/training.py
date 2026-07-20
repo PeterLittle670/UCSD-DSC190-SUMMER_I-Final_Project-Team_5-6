@@ -201,7 +201,8 @@ def train(cfg: Config, tub_paths: str, model: str = None,
 
     # Optionally build the MC-Dropout confidence calibration on the training
     # tubs, so the trained model ships with a <model>.calib.json (saved next to
-    # the model) that the --uncertainty dashboard uses to show a confidence %.
+    # the model) that the dashboard uses to show a confidence % when
+    # USE_MC_DROPOUT_CONFIDENCE is enabled.
     # Off by default because it adds a replay pass over the data; enable with
     # MC_DROPOUT_AUTO_CALIBRATE = True. Linear model only (MC-Dropout relies on
     # the dropout layers in the default linear architecture).

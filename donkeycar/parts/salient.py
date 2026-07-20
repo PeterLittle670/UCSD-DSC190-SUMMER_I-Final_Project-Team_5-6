@@ -1,106 +1,119 @@
-#from https://github.com/ermolenkodev/keras-salient-object-visualisation
+"""
+Vanilla-gradient saliency: how much would each *pixel* of the input image
+change the model's steering(+throttle) output if perturbed, via the gradient
+of the summed output(s) w.r.t. the raw input image.
+
+This is a different technique from Grad-CAM
+(``donkeycar.parts.gradcam_uncertainty``), which operates on the last
+convolutional layer's coarse feature grid and is smoothed by channel-pooling
+into a small number of spatial cells. Vanilla-gradient saliency computes
+gradients directly against full-resolution input pixels instead, giving a
+finer but visibly noisier, more spatially-diffuse view of "what matters to
+the prediction" -- a complementary lens, not a replacement. In practice
+Grad-CAM tends to produce a small number of clean, localized hotspots, while
+vanilla-gradient saliency tends to highlight many pixels weakly across a
+wider area (see the "Caveats" note below).
+
+Used by:
+  * ``donkeycar.management.makemovie`` -- the ``--salient`` flag on
+    ``donkey makemovie`` burns this into an exported video, frame by frame.
+  * ``donkeycar.parts.gradcam_uncertainty`` -- offered as a fourth overlay
+    layer ("saliency") alongside the Grad-CAM attention/uncertainty maps and
+    the feature-space novelty map, for the same analysed frames.
+
+Caveats:
+  * Compared to Grad-CAM, pixel-level gradients are typically noisier and
+    less spatially decisive -- treat this as one more data point, not a more
+    "correct" answer than the other overlays.
+  * Model scope: like the rest of this toolkit, only architectures with
+    identifiable output layers (name containing "out", excluding dropout
+    layers) are supported -- this covers the default linear and categorical
+    architectures.
+"""
 import os
-from keras import backend as K
-import tensorflow as tf
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-from keras.layers import Input, Dense, merge
-from keras.models import Model
-from keras.layers import Convolution2D, MaxPooling2D, Reshape, BatchNormalization
-from keras.layers import Activation, Dropout, Flatten, Dense
-import cv2
+import tempfile
+
 import numpy as np
+import tensorflow as tf
+from tensorflow.python.keras import activations
+from tensorflow.python.keras.models import load_model
 
-class SalientVis():
-    '''
-    Note, this part is quite tuned ust for the image dimensions and layers
-    in our standard models. It will not reflect cropping or additional layers
-    that might be in your model.
-    '''
 
-    def __init__(self, kerasPart):
-        self.model = kerasPart.model
-        self.init_salient(self.model)
+def _apply_linear_output_activation(model):
+    """
+    Force the model's output layer(s) (name contains "out", excluding
+    dropout layers) to linear activation, and rebuild the graph via a
+    save/reload round-trip -- directly setting ``layer.activation`` does not
+    actually rebuild the compute graph. A no-op for architectures whose
+    outputs are already linear (e.g. the default linear model); needed for
+    architectures with a non-linear output activation (e.g. categorical's
+    softmax), so gradients are taken against raw scores, not squashed ones.
 
-    def run(self, image):
-        if image is None:
-            return
-        image = self.draw_salient(image)
-        image = image * 255
-        image = image.astype('uint8')
-        return image
+    :return: (model, found_any) -- `model` is unchanged if no matching
+             output layer was found, and `found_any` is False.
+    """
+    output_idx = [i for i, layer in enumerate(model.layers)
+                 if 'dropout' not in layer.name.lower()
+                 and 'out' in layer.name.lower()]
+    if not output_idx:
+        return model, False
 
-    def init_salient(self, model):
-        img_in = Input(shape=(120, 160, 3), name='img_in')
-        x = img_in
-        x = Convolution2D(24, (5,5), strides=(2,2), activation='relu', name='conv1')(x)
-        x = Convolution2D(32, (5,5), strides=(2,2), activation='relu', name='conv2')(x)
-        x = Convolution2D(64, (5,5), strides=(2,2), activation='relu', name='conv3')(x)
-        x = Convolution2D(64, (3,3), strides=(2,2), activation='relu', name='conv4')(x)
-        conv_5 = Convolution2D(64, (3,3), strides=(1,1), activation='relu', name='conv5')(x)
-        self.convolution_part = Model(inputs=[img_in], outputs=[conv_5])
+    for i in output_idx:
+        model.layers[i].activation = activations.linear
 
-        for layer_num in ('1', '2', '3', '4', '5'):
-            self.convolution_part.get_layer('conv' + layer_num).set_weights(model.get_layer('conv2d_' + layer_num).get_weights())
-        
-        self.inp = self.convolution_part.input                                           # input placeholder
-        self.outputs = [layer.output for layer in self.convolution_part.layers[1:]]          # all layer outputs
-        self.functor = K.function([self.inp], self.outputs)
+    model_path = os.path.join(tempfile.gettempdir(),
+                              next(tempfile._get_candidate_names()) + '.h5')
+    try:
+        model.save(model_path)
+        return load_model(model_path, compile=False), True
+    finally:
+        os.remove(model_path)
 
-        kernel_3x3 = tf.constant(np.array([
-        [[[1]], [[1]], [[1]]], 
-        [[[1]], [[1]], [[1]]], 
-        [[[1]], [[1]], [[1]]]
-        ]), tf.float32)
 
-        kernel_5x5 = tf.constant(np.array([
-                [[[1]], [[1]], [[1]], [[1]], [[1]]], 
-                [[[1]], [[1]], [[1]], [[1]], [[1]]], 
-                [[[1]], [[1]], [[1]], [[1]], [[1]]],
-                [[[1]], [[1]], [[1]], [[1]], [[1]]],
-                [[[1]], [[1]], [[1]], [[1]], [[1]]]
-        ]), tf.float32)
+class VanillaGradientSaliency:
+    """
+    Computes a full-resolution pixel-saliency map: the L2 norm, across
+    output channels, of the gradient of each output w.r.t. each input pixel.
 
-        self.layers_kernels = {5: kernel_3x3, 4: kernel_3x3, 3: kernel_5x5, 2: kernel_5x5, 1: kernel_5x5}
+    :param model:       a raw Keras model (e.g. ``pilot.interpreter.model``).
+    :param categorical: True for categorical/binned outputs (uses each
+                        output's argmax score), False (default) for
+                        continuous linear outputs (uses the raw score).
+    """
 
-        self.layers_strides = {5: [1, 1, 1, 1], 4: [1, 2, 2, 1], 3: [1, 2, 2, 1], 2: [1, 2, 2, 1], 1: [1, 2, 2, 1]}
+    def __init__(self, model, categorical=False):
+        self.categorical = categorical
+        self.model, self.found_output_layers = \
+            _apply_linear_output_activation(model)
 
-        
-    def compute_visualisation_mask(self, img):
-        #from https://github.com/ermolenkodev/keras-salient-object-visualisation
-        
-        activations = self.functor([np.array([img])])
-        activations = [np.reshape(img, (1, img.shape[0], img.shape[1], img.shape[2]))] + activations
-        upscaled_activation = np.ones((3, 6))
-        for layer in [5, 4, 3, 2, 1]:
-            averaged_activation = np.mean(activations[layer], axis=3).squeeze(axis=0) * upscaled_activation
-            output_shape = (activations[layer - 1].shape[1], activations[layer - 1].shape[2])
-            x = tf.constant(
-                np.reshape(averaged_activation, (1,averaged_activation.shape[0],averaged_activation.shape[1],1)),
-                tf.float32
-            )
-            conv = tf.nn.conv2d_transpose(
-                x, self.layers_kernels[layer],
-                output_shape=(1,output_shape[0],output_shape[1], 1), 
-                strides=self.layers_strides[layer], 
-                padding='VALID'
-            )
-            with tf.Session() as session:
-                result = session.run(conv)
-            upscaled_activation = np.reshape(result, output_shape)
-        final_visualisation_mask = upscaled_activation
-        return (final_visualisation_mask - np.min(final_visualisation_mask))/(np.max(final_visualisation_mask) - np.min(final_visualisation_mask))
+    def saliency_map(self, norm_img):
+        """
+        :param norm_img: float32 image, [0,1], shape (H, W, C)
+        :return: (H, W) float map normalised to [0,1]
+        """
+        img = tf.Variable(norm_img[np.newaxis, ...], dtype=tf.float32)
 
-    def draw_salient(self, img):
-        #from https://github.com/ermolenkodev/keras-salient-object-visualisation
-        alpha = 0.004
-        beta = 1.0 - alpha
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(img)
+            preds = self.model(img, training=False)
+            preds = preds if isinstance(preds, (list, tuple)) else [preds]
+            if self.categorical:
+                pred_list = [p[0][tf.math.argmax(p[0])] for p in preds]
+            else:
+                pred_list = preds
 
-        salient_mask = self.compute_visualisation_mask(img)
-        salient_mask_stacked = np.dstack((salient_mask,salient_mask))
-        salient_mask_stacked = np.dstack((salient_mask_stacked,salient_mask))
-        blend = cv2.addWeighted(img.astype('float32'), alpha, salient_mask_stacked, beta, 0.0)
-        return blend
+        grads_sq = 0
+        for p in pred_list:
+            grads_sq += tf.math.square(tape.gradient(p, img))
+        grads = tf.math.sqrt(grads_sq)
+        grads = tf.reduce_sum(grads, axis=-1)[0].numpy()   # (H, W)
+
+        gmin, gmax = float(grads.min()), float(grads.max())
+        if gmax > gmin:
+            grads = (grads - gmin) / (gmax - gmin)
+        else:
+            grads = np.zeros_like(grads)
+        return grads
 
     def shutdown(self):
         pass
-        

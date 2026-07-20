@@ -123,6 +123,8 @@ class LocalWebController(tornado.web.Application):
         self.num_records = 0
         self.confidence = None            # last MC-Dropout confidence % (or None)
         self.last_confidence_pct = None   # last value pushed to clients
+        self.novelty = None                # last novelty (OOD) % (or None)
+        self.last_novelty_pct = None       # last value pushed to clients
         self.wsclients = []
         self.loop = None
 
@@ -165,7 +167,7 @@ class LocalWebController(tornado.web.Application):
                     pass
 
     def run_threaded(self, img_arr=None, num_records=0, mode=None,
-                     recording=None, confidence=None):
+                     recording=None, confidence=None, novelty=None):
         """
         :param img_arr: current camera image or None
         :param num_records: current number of data records
@@ -173,6 +175,8 @@ class LocalWebController(tornado.web.Application):
         :param recording: default recording mode
         :param confidence: MC-Dropout confidence % (0-100) or None if the
                            feature is disabled / the model is uncalibrated
+        :param novelty: feature-space novelty (OOD) % (0-100) or None if the
+                        feature is disabled / the model is uncalibrated
         """
         self.img_arr = img_arr
         self.num_records = num_records
@@ -210,6 +214,14 @@ class LocalWebController(tornado.web.Application):
                 self.last_confidence_pct = conf_pct
                 changes['confidence'] = conf_pct
 
+        # Push feature-space novelty (OOD) score the same throttled way.
+        self.novelty = novelty
+        if novelty is not None:
+            nov_pct = int(round(novelty))
+            if nov_pct != self.last_novelty_pct:
+                self.last_novelty_pct = nov_pct
+                changes['novelty'] = nov_pct
+
         #
         # get latched button presses then clear button presses
         # Next iteration will clear press in memory
@@ -228,9 +240,9 @@ class LocalWebController(tornado.web.Application):
         return self.angle, self.throttle, self.mode, self.recording, buttons
 
     def run(self, img_arr=None, num_records=0, mode=None, recording=None,
-            confidence=None):
+            confidence=None, novelty=None):
         return self.run_threaded(img_arr, num_records, mode, recording,
-                                 confidence)
+                                 confidence, novelty)
 
     def shutdown(self):
         pass

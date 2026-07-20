@@ -13,17 +13,35 @@ fine for post-drive analysis but too heavy for the 20Hz drive loop.
 
 Frame selection (feasibility): by default only the top-K most uncertain
 frames are analysed, ranked by the steering variance either logged in the
-tub (``pilot/smoothed_variance``, written when driving with --uncertainty)
+tub (``pilot/smoothed_variance``, written when driving with
+USE_MC_DROPOUT_CONFIDENCE enabled)
 or recomputed by replaying the tub through the MC-Dropout part. ``--all``
 forces every frame (use only for short drives).
 
+If the model's calibration also has novelty (Mahalanobis distance) stats --
+see ``donkeycar.parts.mc_calibrate`` / ``donkeycar.parts.novelty`` -- a
+per-frame novelty distance/score is added to every timeline entry (cheap, a
+single forward pass, computed for ALL frames), and a third, independent
+spatial "novelty map" overlay is rendered for the analysed frames, showing
+*where* in the image the features look unlike anything in training data --
+a different question from the attention/uncertainty overlays above.
+
+Each analysed frame also gets a fourth overlay: vanilla-gradient pixel
+saliency (see ``donkeycar.parts.salient``) -- gradients taken directly
+against full-resolution input pixels rather than the coarse conv2d_5 grid.
+A different, noisier, complementary lens to the three maps above.
+
 Output (consumed by the Feature 4 viewer):
     <out>/
-      data.json            -- timeline of variance/confidence for ALL frames,
-                              plus an entry per analysed frame
+      data.json            -- timeline of variance/confidence/novelty for ALL
+                              frames, plus an entry per analysed frame
       images/<idx>_orig.jpg      -- camera frame
       images/<idx>_unc.png       -- uncertainty-map overlay (attention variance)
       images/<idx>_attn.png      -- mean-attention overlay (where it looked)
+      images/<idx>_novelty.png   -- novelty overlay (where features are
+                                   unlike training data); only if the model's
+                                   calibration has novelty stats
+      images/<idx>_saliency.png  -- vanilla-gradient pixel saliency overlay
 
 Usage:
     python -m donkeycar.parts.gradcam_uncertainty \
@@ -32,7 +50,12 @@ Usage:
 
 Caveats: linear model only (same scope as the live signal); the variance map
 inherits MC-Dropout's blind spots -- it measures disagreement between dropout
-sub-networks, not distance from the training distribution.
+sub-networks, not distance from the training distribution. The novelty map
+is the complementary signal (distance from training distribution) and
+inherits its own blind spots -- see donkeycar.parts.novelty's module
+docstring (diagonal-covariance approximation, position-independent spatial
+pooling). The saliency map is noisier and less spatially decisive than
+Grad-CAM -- see donkeycar.parts.salient's module docstring.
 """
 import argparse
 import json
@@ -133,6 +156,39 @@ class GradCamUncertainty:
             mean_up = mean_up / mean_up.max()
         return mean_up, var_up, raw_peak
 
+    def novelty_map(self, img_arr, mean, var, active_dims=None, eps=1e-6):
+        """
+        Spatial Mahalanobis-distance "novelty" map: how far each conv2d_5
+        grid location's feature vector is from the training distribution
+        (see donkeycar.parts.novelty). Unlike attention_maps/uncertainty_map,
+        this needs no dropout stochasticity and no gradient -- a single plain
+        forward pass -- since novelty is a distance-from-training-distribution
+        measure, not an agreement measure.
+
+        :param img_arr: uint8 [0,255] camera frame (H, W, C)
+        :param mean, var, active_dims, eps: the fitted 'novelty_spatial'
+                                            calibration block's stats (see
+                                            donkeycar.parts.mc_calibrate).
+        :return: (map01, raw_peak) -- map01 is (H, W) upsampled to image
+                 size and normalised to [0,1]; raw_peak is the pre-
+                 normalisation peak distance (for the readout/debugging).
+        """
+        from donkeycar.parts.novelty import mahalanobis_diag
+        from donkeycar.utils import normalize_image
+
+        norm = normalize_image(img_arr).astype(np.float32)
+        features, _ = self.grad_model(norm[np.newaxis, ...], training=False)
+        feat = features.numpy()[0]                        # (h, w, c)
+
+        dist_grid = mahalanobis_diag(feat, mean, var, active_dims, eps)
+        raw_peak = float(dist_grid.max())
+
+        h, w = img_arr.shape[:2]
+        up = _resize_map(dist_grid, w, h)
+        if raw_peak > 0:
+            up = up / up.max()
+        return up, raw_peak
+
 
 def _resize_map(map2d, width, height):
     """Bilinear upsample a float map to (height, width)."""
@@ -160,17 +216,25 @@ def overlay_heatmap(img_arr, map01, strength=0.6):
     return (out * 255).astype(np.uint8)
 
 
-def _collect_variances(records, model_path, cfg, num_passes, alpha):
+def _collect_variances(records, model_path, cfg, num_passes, alpha,
+                       progress_callback=None):
     """
     Get a per-frame (raw, smoothed) steering-variance list, preferring values
-    logged in the tub (drives recorded with --uncertainty), else replaying
-    the frames through the MC-Dropout part.
+    logged in the tub (drives recorded with USE_MC_DROPOUT_CONFIDENCE
+    enabled), else replaying the frames through the MC-Dropout part.
+
+    :param progress_callback: optional ``callback(stage, current, total)``,
+                              called as frames are processed (stage='variance').
+                              Used by the GUI launcher to show progress; safe
+                              to omit for CLI use.
     """
     logged = [r.underlying.get('pilot/smoothed_variance') for r in records]
     n_logged = sum(v is not None for v in logged)
     if n_logged >= 0.5 * len(records) and n_logged > 0:
         logger.info(f'Using logged uncertainty for {n_logged}/{len(records)} '
                     f'frames.')
+        if progress_callback:
+            progress_callback('variance', len(records), len(records))
         return [v if v is not None else 0.0 for v in logged]
 
     logger.info(f'No logged uncertainty in tub; replaying {len(records)} '
@@ -181,23 +245,77 @@ def _collect_variances(records, model_path, cfg, num_passes, alpha):
     pilot.load(model_path)
     part = MCDropoutConfidence(pilot, num_passes=num_passes, alpha=alpha)
     smoothed = []
+    total = len(records)
     for i, record in enumerate(records):
         smoothed.append(part.run(record.image())[4])
         if (i + 1) % 200 == 0:
-            logger.info(f'  {i + 1}/{len(records)} frames')
+            logger.info(f'  {i + 1}/{total} frames')
+        if progress_callback:
+            progress_callback('variance', i + 1, total)
+    return smoothed
+
+
+def _collect_novelty(records, model_path, cfg, calib, progress_callback=None):
+    """
+    Get a per-frame smoothed novelty (Mahalanobis) distance list, preferring
+    values logged in the tub, else replaying through FeatureNoveltyDetector.
+    Returns a list of raw floats (distances, NOT scores) the same length as
+    `records`, or None if no 'novelty_global' calibration is available at all
+    (nothing to score against).
+
+    :param progress_callback: optional ``callback(stage, current, total)``,
+                              called as frames are processed (stage='novelty').
+    """
+    if calib is None or calib.get('novelty_global') is None:
+        return None
+
+    logged = [r.underlying.get('pilot/smoothed_novelty_distance')
+             for r in records]
+    n_logged = sum(v is not None for v in logged)
+    if n_logged >= 0.5 * len(records) and n_logged > 0:
+        logger.info(f'Using logged novelty distance for {n_logged}/'
+                    f'{len(records)} frames.')
+        if progress_callback:
+            progress_callback('novelty', len(records), len(records))
+        return [v if v is not None else 0.0 for v in logged]
+
+    logger.info(f'No logged novelty distance in tub; replaying '
+                f'{len(records)} frames through FeatureNoveltyDetector...')
+    from donkeycar.parts.keras import KerasLinear
+    from donkeycar.parts.mc_calibrate import default_calib_path
+    from donkeycar.parts.novelty import FeatureNoveltyDetector
+    pilot = KerasLinear()
+    pilot.load(model_path)
+    part = FeatureNoveltyDetector(pilot, calibration_path=default_calib_path(model_path))
+    smoothed = []
+    total = len(records)
+    for i, record in enumerate(records):
+        smoothed.append(part.run(record.image())[2])
+        if (i + 1) % 200 == 0:
+            logger.info(f'  {i + 1}/{total} frames')
+        if progress_callback:
+            progress_callback('novelty', i + 1, total)
     return smoothed
 
 
 def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                 top_k=50, percentile=None, analyze_all=False, limit=None,
-                export_frames=False):
+                export_frames=False, progress_callback=None):
     """
     Run the full Feature 3 pipeline on one tub. Returns the data.json dict.
+
+    :param progress_callback: optional ``callback(stage, current, total)``,
+                              called throughout the three stages in order
+                              ('variance', 'novelty', 'gradcam'). Used by the
+                              GUI launcher (``donkeycar.parts.uncertainty_viewer``)
+                              to show live progress; harmless to omit for CLI use.
     """
     from donkeycar.parts.keras import KerasLinear
     from donkeycar.parts.mc_calibrate import (default_calib_path,
                                               load_calibration,
-                                              variance_to_confidence)
+                                              variance_to_confidence,
+                                              novelty_distance_to_score)
+    from donkeycar.parts.salient import VanillaGradientSaliency
     from donkeycar.pipeline.types import TubDataset
 
     t0 = time.time()
@@ -212,9 +330,10 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
         raise ValueError(f'No records found in {tub_path}')
 
     # Per-frame uncertainty timeline (logged or replayed).
-    variances = _collect_variances(records, model_path, cfg, num_passes, alpha)
+    variances = _collect_variances(records, model_path, cfg, num_passes, alpha,
+                                   progress_callback=progress_callback)
 
-    # Confidence % if this model has a calibration.
+    # Confidence % (and novelty stats, if present) from the model's calibration.
     calib = None
     calib_path = default_calib_path(model_path)
     if os.path.exists(calib_path):
@@ -227,13 +346,27 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
     def conf(v):
         return variance_to_confidence(v, calib) if calib is not None else None
 
+    # Per-frame novelty (out-of-distribution) timeline -- cheap, every frame,
+    # independent of the Grad-CAM frame selection below. None if the model's
+    # calibration has no novelty stats at all (older calibration).
+    novelty_distances = _collect_novelty(records, model_path, cfg, calib,
+                                         progress_callback=progress_callback)
+
+    def nov_score(d):
+        if calib is None or calib.get('novelty_global') is None or d is None:
+            return None
+        return novelty_distance_to_score(d, calib['novelty_global'])
+
     timeline = []
-    for record, v in zip(records, variances):
+    for i, (record, v) in enumerate(zip(records, variances)):
+        nd = novelty_distances[i] if novelty_distances is not None else None
         timeline.append({
             'index': record.underlying.get('_index'),
             'timestamp_ms': record.underlying.get('_timestamp_ms'),
             'variance': float(v),
             'confidence': conf(v),
+            'novelty_distance': nd,
+            'novelty_score': nov_score(nd),
             # image filename inside the tub's images/ dir, so the viewer can
             # show the camera frame for non-analysed frames when the tub is
             # available locally.
@@ -266,10 +399,22 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
         selected = list(order[:top_k])
     logger.info(f'Analysing {len(selected)} of {len(records)} frames.')
 
-    # Build the Grad-CAM engine on the raw Keras model.
+    # Build the Grad-CAM and vanilla-gradient-saliency engines on the raw
+    # Keras model (two independent, complementary attribution methods).
+    from donkeycar.utils import normalize_image
     pilot = KerasLinear()
     pilot.load(model_path)
     engine = GradCamUncertainty(pilot.interpreter.model, num_passes=num_passes)
+    saliency_engine = VanillaGradientSaliency(pilot.interpreter.model)
+
+    # Spatial novelty stats, if this model's calibration has them -- computing
+    # the per-frame spatial map only needs these arrays, no extra model.
+    novelty_spatial = calib.get('novelty_spatial') if calib else None
+    if novelty_spatial is not None:
+        ns_mean = np.array(novelty_spatial['mean'])
+        ns_var = np.array(novelty_spatial['var'])
+        ns_active = np.array(novelty_spatial['active_dims'])
+        ns_eps = novelty_spatial['eps']
 
     images_dir = os.path.join(out_dir, 'images')
     os.makedirs(images_dir, exist_ok=True)
@@ -290,7 +435,7 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
         Image.fromarray(overlay_heatmap(img, mean_map)).save(
             os.path.join(images_dir, attn_name))
 
-        frames[str(idx)] = {
+        frame_entry = {
             'orig': f'images/{orig_name}',
             'overlay': f'images/{unc_name}',
             'attention': f'images/{attn_name}',
@@ -298,8 +443,28 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             'confidence': conf(variances[i]),
             'attention_variance_peak': raw_peak,
         }
+
+        if novelty_spatial is not None:
+            nov_map, nov_peak = engine.novelty_map(
+                img, ns_mean, ns_var, ns_active, ns_eps)
+            nov_name = f'{idx:06d}_novelty.png'
+            Image.fromarray(overlay_heatmap(img, nov_map)).save(
+                os.path.join(images_dir, nov_name))
+            frame_entry['novelty'] = f'images/{nov_name}'
+            frame_entry['novelty_map_peak'] = nov_peak
+
+        sal_map = saliency_engine.saliency_map(
+            normalize_image(img).astype(np.float32))
+        sal_name = f'{idx:06d}_saliency.png'
+        Image.fromarray(overlay_heatmap(img, sal_map)).save(
+            os.path.join(images_dir, sal_name))
+        frame_entry['saliency'] = f'images/{sal_name}'
+
+        frames[str(idx)] = frame_entry
         if (n + 1) % 10 == 0:
             logger.info(f'  analysed {n + 1}/{len(selected)} frames')
+        if progress_callback:
+            progress_callback('gradcam', n + 1, len(selected))
 
     data = {
         'model': os.path.basename(model_path),

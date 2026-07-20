@@ -1,0 +1,198 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Explainability Analysis</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #f5f6f8; color: #24292f;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    background: #fff; border-bottom: 1px solid #d8dee4;
+    padding: 10px 18px;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header .meta { font-size: 12px; color: #57606a; margin-top: 2px; }
+  main { max-width: 640px; margin: 14px auto; padding: 0 14px; }
+  .panel {
+    background: #fff; border: 1px solid #d8dee4; border-radius: 6px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 4px; }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 6px 8px; font: inherit; font-size: 13px;
+    border: 1px solid #d0d7de; border-radius: 6px;
+  }
+  .radio-row { display: flex; gap: 16px; align-items: center; font-size: 13px; }
+  .radio-row label { display: inline-flex; align-items: center; gap: 5px;
+                     font-weight: 400; margin: 0; }
+  .mode-value { width: 100px; margin-left: 6px; }
+  .checkbox-row { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .checkbox-row label { font-weight: 400; margin: 0; }
+  .hint { font-size: 11px; color: #8b949e; margin-top: 4px; }
+  button {
+    font: inherit; font-size: 14px; font-weight: 600; padding: 8px 20px;
+    border: none; border-radius: 6px; background: #0969da; color: #fff;
+    cursor: pointer; margin-top: 18px;
+  }
+  button:hover { background: #0757ba; }
+  button:disabled { background: #8b949e; cursor: not-allowed; }
+  #progress-panel { display: none; }
+  #progress-bar-wrap {
+    background: #eef1f4; border-radius: 6px; height: 10px; overflow: hidden;
+    margin: 10px 0 6px;
+  }
+  #progress-bar {
+    background: #0969da; height: 100%; width: 0%; transition: width 0.3s;
+  }
+  #progress-text { font-size: 13px; color: #57606a; }
+  #error-box {
+    display: none; background: #fff1f0; border: 1px solid #ffccc7;
+    color: #cf1322; padding: 10px 12px; border-radius: 6px; font-size: 13px;
+    margin-top: 10px;
+  }
+  datalist { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Run Explainability Analysis</h1>
+  <div class="meta">Grad-CAM attention/uncertainty, feature-space novelty, and pixel-gradient saliency for a recorded drive.</div>
+</header>
+
+<main>
+  <div class="panel" id="form-panel">
+    <label for="tub">Tub path</label>
+    <input type="text" id="tub" list="tubs-list" placeholder="data/">
+    <datalist id="tubs-list"></datalist>
+
+    <label for="model">Model path</label>
+    <input type="text" id="model" list="models-list" placeholder="models/mypilot.h5">
+    <datalist id="models-list"></datalist>
+
+    <label>Frames to analyse</label>
+    <div class="radio-row">
+      <label><input type="radio" name="mode" value="top_k" checked> top-K most uncertain</label>
+      <label><input type="radio" name="mode" value="percentile"> percentile &ge;</label>
+      <label><input type="radio" name="mode" value="all"> all frames</label>
+      <input type="number" id="mode-value" class="mode-value" value="50">
+    </div>
+    <div class="hint">"all" analyses every frame -- only practical for short drives.</div>
+
+    <label for="limit">Limit frames considered (optional)</label>
+    <input type="number" id="limit" placeholder="leave blank to use the whole tub">
+    <div class="hint">Caps how many tub records are even looked at -- use this for a quick test run.</div>
+
+    <div class="checkbox-row" style="margin-top: 14px;">
+      <input type="checkbox" id="export-frames">
+      <label for="export-frames">Export every camera frame (self-contained output, larger folder)</label>
+    </div>
+
+    <button id="run-btn" onclick="runAnalysis()">Run Analysis</button>
+    <div id="error-box"></div>
+  </div>
+
+  <div class="panel" id="progress-panel">
+    <div id="progress-text">Starting&hellip;</div>
+    <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
+  </div>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  const $ = id => document.getElementById(id);
+
+  fetch('/api/scan').then(r => r.json()).then(d => {
+    const fill = (listId, values, fieldId) => {
+      const dl = $(listId);
+      dl.innerHTML = values.map(v => `<option value="${v}">`).join('');
+      if (values.length === 1) $(fieldId).value = values[0];
+    };
+    fill('tubs-list', d.tubs || [], 'tub');
+    fill('models-list', d.models || [], 'model');
+  }).catch(() => {});
+
+  const STAGE_LABEL = {
+    starting: 'Starting…',
+    variance: 'Replaying drive — computing MC-Dropout uncertainty',
+    novelty: 'Replaying drive — computing feature-space novelty',
+    gradcam: 'Rendering Grad-CAM / novelty / saliency overlays',
+  };
+
+  window.runAnalysis = function () {
+    const tub = $('tub').value.trim();
+    const model = $('model').value.trim();
+    $('error-box').style.display = 'none';
+    if (!tub || !model) {
+      $('error-box').textContent = 'Tub and model paths are both required.';
+      $('error-box').style.display = 'block';
+      return;
+    }
+    const mode = document.querySelector('input[name=mode]:checked').value;
+    const body = {
+      tub: tub,
+      model: model,
+      mode: mode,
+      value: $('mode-value').value,
+      limit: $('limit').value,
+      export_frames: $('export-frames').checked,
+    };
+
+    $('run-btn').disabled = true;
+    $('form-panel').style.opacity = '0.6';
+    $('progress-panel').style.display = 'block';
+    $('progress-text').textContent = 'Starting…';
+    $('progress-bar').style.width = '2%';
+
+    fetch('/api/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }).then(r => r.json()).then(d => {
+      if (!d.ok) {
+        showError(d.error || 'Failed to start analysis.');
+        return;
+      }
+      pollProgress();
+    }).catch(e => showError(String(e)));
+  };
+
+  function showError(msg) {
+    $('run-btn').disabled = false;
+    $('form-panel').style.opacity = '1';
+    $('error-box').textContent = msg;
+    $('error-box').style.display = 'block';
+  }
+
+  function pollProgress() {
+    fetch('/api/progress').then(r => r.json()).then(p => {
+      if (p.error) {
+        showError(p.error);
+        return;
+      }
+      const label = STAGE_LABEL[p.stage] || p.stage || 'Working…';
+      const pct = p.total ? Math.round(100 * p.current / p.total) : 2;
+      $('progress-text').textContent =
+        label + (p.total ? ` (${p.current}/${p.total})` : '');
+      $('progress-bar').style.width = Math.max(2, pct) + '%';
+
+      if (p.done) {
+        if (p.out_dir) {
+          $('progress-text').textContent = 'Done! Opening viewer…';
+          $('progress-bar').style.width = '100%';
+          setTimeout(() => { window.location.href = '/'; }, 600);
+        }
+        return;
+      }
+      setTimeout(pollProgress, 1000);
+    }).catch(() => setTimeout(pollProgress, 2000));
+  }
+})();
+</script>
+</body>
+</html>

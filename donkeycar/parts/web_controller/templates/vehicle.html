@@ -61,7 +61,7 @@
           </div>
         </div>
 
-        <!-- model confidence (MC-Dropout), only shown when --uncertainty is on -->
+        <!-- model confidence (MC-Dropout), only shown when USE_MC_DROPOUT_CONFIDENCE is on -->
         <div id="confidence-panel" class="panel panel-default" style="display: none; clear: both; margin-top: 15px;">
           <div class="panel-heading">
             <strong>Model confidence</strong>
@@ -75,6 +75,24 @@
             <small class="text-muted">
               MC-Dropout uncertainty &mdash; relative to this model's baseline,
               not a calibrated probability.
+            </small>
+          </div>
+        </div>
+
+        <!-- feature-space novelty / OOD detection, only shown when USE_NOVELTY_DETECTION is on -->
+        <div id="novelty-panel" class="panel panel-default" style="display: none; clear: both; margin-top: 15px;">
+          <div class="panel-heading">
+            <strong>Novelty (distribution shift)</strong>
+            <span id="novelty-value" class="pull-right"></span>
+          </div>
+          <div class="panel-body">
+            <div class="progress" id="novelty-progress" style="margin-bottom: 8px;">
+              <div id="novelty-bar" class="progress-bar progress-bar-success"
+                   role="progressbar" style="width: 0%;"></div>
+            </div>
+            <small class="text-muted">
+              How far this scene's features are from the training data
+              &mdash; a different signal from model confidence above.
             </small>
           </div>
         </div>

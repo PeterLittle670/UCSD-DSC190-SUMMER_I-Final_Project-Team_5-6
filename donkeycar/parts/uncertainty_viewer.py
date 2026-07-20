@@ -1,13 +1,16 @@
 """
 Local web viewer for Grad-CAM uncertainty analyses (Feature 4 of the
-uncertainty toolkit).
+uncertainty toolkit) -- and, when no analysis is given yet, a small local
+GUI ("launcher") for running one, so you never have to type the full
+``python -m donkeycar.parts.gradcam_uncertainty --tub ... --model ...``
+command line by hand.
 
 Serves the output folder produced by ``donkeycar.parts.gradcam_uncertainty``
 together with a small self-contained web page (no internet required) that
 provides:
 
   * the camera frame with the uncertainty-map overlay (or mean attention,
-    or the plain frame),
+    novelty, saliency, or the plain frame),
   * a confidence-over-time graph for the whole drive with the current
     position marked, click-to-jump,
   * video-like playback (play/pause at a configurable 2-10 fps, scrub bar,
@@ -17,9 +20,18 @@ Frames without a precomputed uncertainty map simply show the camera frame
 (from the analysis dir if it was created with ``--export-frames``, else
 straight from the tub's images/ folder when the tub is available locally).
 
+**Launcher mode**: if ``--analysis`` is omitted (or points at a directory
+with no ``data.json`` yet), the server shows a form instead of the viewer:
+pick a tub and model (autodiscovered from ``data/`` and ``models/`` in the
+current directory, or typed by hand), choose which frames to analyse, and
+click Run. The analysis runs in this same process on a background thread
+(reusing ``gradcam_uncertainty.analyze_tub`` directly -- no subprocess), the
+page polls progress, and once done the server starts serving the viewer for
+the new output directory automatically -- no second command.
+
 Usage:
-    python -m donkeycar.parts.uncertainty_viewer --analysis <dir> \
-        [--tub <tub_dir>] [--port 8890] [--host 127.0.0.1]
+    python -m donkeycar.parts.uncertainty_viewer [--analysis <dir>] \
+        [--tub <tub_dir>] [--config <config.py>] [--port 8890] [--host 127.0.0.1]
 
 Then open http://localhost:8890 in a browser.
 """
@@ -27,31 +39,176 @@ import argparse
 import json
 import logging
 import os
-from functools import partial
+import threading
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 logger = logging.getLogger(__name__)
 
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          'uncertainty_viewer.html')
+LAUNCHER_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'analysis_launcher.html')
+
+
+class LauncherState:
+    """
+    Owns the background analysis thread and its progress state. One instance
+    per server process, shared (read via a lock) across request-handling
+    threads.
+    """
+
+    def __init__(self, cfg, cwd):
+        self.cfg = cfg
+        self.cwd = cwd
+        self._lock = threading.Lock()
+        self._progress = {'running': False, 'done': False, 'error': None,
+                          'stage': None, 'current': 0, 'total': 0,
+                          'out_dir': None}
+
+    def progress_snapshot(self):
+        with self._lock:
+            return dict(self._progress)
+
+    def _set(self, **kwargs):
+        with self._lock:
+            self._progress.update(kwargs)
+
+    def scan_defaults(self):
+        """Best-effort discovery of tub dirs (contain manifest.json) and
+        model .h5 files under the current directory, for the form's
+        suggestion lists. Returns {} entries if nothing found -- the form
+        fields are free text either way."""
+        tubs = []
+        data_dir = os.path.join(self.cwd, 'data')
+        if os.path.isfile(os.path.join(data_dir, 'manifest.json')):
+            tubs.append('data')
+        if os.path.isdir(data_dir):
+            for name in sorted(os.listdir(data_dir)):
+                p = os.path.join(data_dir, name)
+                if os.path.isdir(p) and os.path.isfile(
+                        os.path.join(p, 'manifest.json')):
+                    tubs.append(os.path.join('data', name))
+
+        models = []
+        models_dir = os.path.join(self.cwd, 'models')
+        if os.path.isdir(models_dir):
+            for name in sorted(os.listdir(models_dir)):
+                if name.lower().endswith('.h5'):
+                    models.append(os.path.join('models', name))
+
+        return {'tubs': tubs, 'models': models}
+
+    def start(self, form):
+        with self._lock:
+            if self._progress['running']:
+                raise RuntimeError('An analysis is already running.')
+            self._progress = {'running': True, 'done': False, 'error': None,
+                              'stage': 'starting', 'current': 0, 'total': 0,
+                              'out_dir': None}
+        thread = threading.Thread(target=self._run, args=(form,), daemon=True)
+        thread.start()
+
+    def _run(self, form):
+        try:
+            tub = form['tub']
+            model = form['model']
+            if not tub or not model:
+                raise ValueError('Tub and model paths are required.')
+            mode = form.get('mode', 'top_k')
+            out_dir = form.get('out') or os.path.join(
+                os.path.expanduser(tub), 'gradcam_analysis')
+
+            def cb(stage, current, total):
+                self._set(stage=stage, current=current, total=total)
+
+            from donkeycar.parts.gradcam_uncertainty import analyze_tub
+            analyze_tub(
+                self.cfg, tub, model, out_dir,
+                num_passes=getattr(self.cfg, 'MC_DROPOUT_PASSES', 15),
+                alpha=getattr(self.cfg, 'MC_DROPOUT_ALPHA', 0.2),
+                top_k=int(form['value']) if mode == 'top_k'
+                      and form.get('value') else 50,
+                percentile=float(form['value']) if mode == 'percentile'
+                          and form.get('value') else None,
+                analyze_all=(mode == 'all'),
+                limit=int(form['limit']) if form.get('limit') else None,
+                export_frames=bool(form.get('export_frames')),
+                progress_callback=cb)
+
+            # Point the viewer at the freshly-produced analysis.
+            ViewerHandler.active_dir = os.path.abspath(out_dir)
+            candidate = os.path.join(os.path.expanduser(tub), 'images')
+            ViewerHandler.tub_images_dir = \
+                os.path.abspath(candidate) if os.path.isdir(candidate) else None
+
+            self._set(running=False, done=True, out_dir=out_dir)
+        except Exception as e:
+            logger.exception('Analysis failed')
+            self._set(running=False, done=True, error=str(e))
 
 
 class ViewerHandler(SimpleHTTPRequestHandler):
-    """Serves the analysis directory, the viewer page at '/', and (when a
-    tub is available) raw camera frames at '/tub/<filename>'."""
+    """
+    Serves either the analysis viewer (if ``active_dir`` has a ready
+    ``data.json``) or the launcher form (otherwise), plus a small JSON API
+    for the launcher (``/api/scan``, ``/api/run``, ``/api/progress``) and raw
+    camera frames at ``/tub/<filename>`` when a tub is available.
 
-    # set once in main(); shared by all request threads (read-only)
+    ``active_dir``/``tub_images_dir``/``launcher_state`` are mutable class
+    attributes rather than constructor args, because ``http.server`` creates
+    a fresh handler instance per request -- setting them here lets the
+    *directory being served* change at runtime (e.g. once a launcher-mode
+    analysis finishes) without restarting the server.
+    """
+
     tub_images_dir = None
+    active_dir = None
+    launcher_state = None
+
+    def __init__(self, *args, **kwargs):
+        directory = ViewerHandler.active_dir or os.getcwd()
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def _analysis_ready(self):
+        return (ViewerHandler.active_dir is not None
+                and os.path.isfile(
+                    os.path.join(ViewerHandler.active_dir, 'data.json')))
 
     def do_GET(self):
-        if self.path in ('/', '/index.html'):
-            return self._send_file(HTML_PATH, 'text/html; charset=utf-8')
+        if self.path.startswith('/') and '?' in self.path:
+            path, query = self.path.split('?', 1)
+        else:
+            path, query = self.path, ''
 
-        if self.path.startswith('/tub/'):
+        if path in ('/', '/index.html'):
+            force_launcher = 'new=1' in query
+            if not force_launcher and self._analysis_ready():
+                return self._send_file(HTML_PATH, 'text/html; charset=utf-8')
+            if ViewerHandler.launcher_state is not None:
+                return self._send_file(LAUNCHER_HTML_PATH,
+                                       'text/html; charset=utf-8')
+            return self.send_error(
+                404, 'No analysis available and launcher mode is off '
+                     '(pass --analysis, or run without it to enable the '
+                     'launcher).')
+
+        if path == '/api/scan':
+            if ViewerHandler.launcher_state is None:
+                return self.send_error(404)
+            return self._send_json(ViewerHandler.launcher_state.scan_defaults())
+
+        if path == '/api/progress':
+            if ViewerHandler.launcher_state is None:
+                return self._send_json({})
+            return self._send_json(
+                ViewerHandler.launcher_state.progress_snapshot())
+
+        if path.startswith('/tub/'):
             if not self.tub_images_dir:
                 return self.send_error(404, 'tub not available')
             # basename() blocks any path traversal
-            name = os.path.basename(self.path[len('/tub/'):])
+            name = os.path.basename(path[len('/tub/'):])
             file_path = os.path.join(self.tub_images_dir, name)
             if not os.path.isfile(file_path):
                 return self.send_error(404)
@@ -59,9 +216,23 @@ class ViewerHandler(SimpleHTTPRequestHandler):
                 else 'image/jpeg'
             return self._send_file(file_path, ctype)
 
-        # everything else (data.json, images/, frames/) comes from the
-        # analysis directory via the base handler
+        # everything else (data.json, images/, frames/) comes from
+        # active_dir via the base handler
         return super().do_GET()
+
+    def do_POST(self):
+        if self.path == '/api/run':
+            if ViewerHandler.launcher_state is None:
+                return self.send_error(404)
+            length = int(self.headers.get('Content-Length', 0))
+            try:
+                form = json.loads(self.rfile.read(length)) if length else {}
+                ViewerHandler.launcher_state.start(form)
+                return self._send_json({'ok': True})
+            except Exception as e:
+                return self._send_json({'ok': False, 'error': str(e)},
+                                       status=400)
+        return self.send_error(404)
 
     def _send_file(self, path, ctype):
         try:
@@ -76,55 +247,79 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, fmt, *args):
         logger.debug(fmt % args)
+
+
+def _load_config(config_path):
+    import donkeycar as dk
+    if config_path is None and not os.path.exists('config.py'):
+        config_path = os.path.join(os.path.dirname(dk.__file__),
+                                   'templates', 'cfg_complete.py')
+        logger.warning(f'No ./config.py; using bundled defaults for the '
+                       f'launcher.')
+    return dk.load_config(config_path)
 
 
 def main(args=None):
     parser = argparse.ArgumentParser(
         prog='uncertainty_viewer',
-        description='Web viewer for Grad-CAM uncertainty analyses.')
-    parser.add_argument('--analysis', required=True,
+        description='Web viewer (and analysis launcher) for Grad-CAM '
+                    'uncertainty analyses.')
+    parser.add_argument('--analysis', default=None,
                         help='analysis dir produced by gradcam_uncertainty '
-                             '(must contain data.json)')
+                             '(must contain data.json). Omit to start in '
+                             'launcher mode and run a new analysis from the '
+                             'browser.')
     parser.add_argument('--tub', default=None,
                         help='tub dir for camera frames of non-analysed '
                              'frames (default: the tub path recorded in '
                              'data.json, if it exists on this machine)')
+    parser.add_argument('--config', default=None,
+                        help='path to config.py, used by launcher mode when '
+                             'starting a new analysis (defaults to '
+                             './config.py, falling back to bundled defaults)')
     parser.add_argument('--port', type=int, default=8890)
     parser.add_argument('--host', default='127.0.0.1',
                         help='bind address (use 0.0.0.0 to allow access '
                              'from other machines)')
     parsed = parser.parse_args(args)
 
-    analysis_dir = os.path.abspath(os.path.expanduser(parsed.analysis))
-    data_json = os.path.join(analysis_dir, 'data.json')
-    if not os.path.isfile(data_json):
-        raise SystemExit(f'No data.json in {analysis_dir} -- run '
-                         f'donkeycar.parts.gradcam_uncertainty first.')
+    cwd = os.getcwd()
+    cfg = _load_config(parsed.config)
+    ViewerHandler.launcher_state = LauncherState(cfg, cwd)
 
-    # Resolve the tub images dir for non-analysed frames: --tub wins, else
-    # the tub path stored in data.json (which may not exist on this machine
-    # -- that's fine, exported frames or a placeholder cover it).
-    tub_dir = parsed.tub
-    if tub_dir is None:
-        with open(data_json) as f:
-            tub_dir = json.load(f).get('tub')
-    tub_images = None
-    if tub_dir:
-        candidate = os.path.join(os.path.expanduser(tub_dir), 'images')
-        if os.path.isdir(candidate):
-            tub_images = os.path.abspath(candidate)
-    ViewerHandler.tub_images_dir = tub_images
-    logger.info(f'Analysis dir : {analysis_dir}')
-    if tub_images:
-        logger.info(f'Tub images   : {tub_images}')
-    else:
-        logger.info('Tub images   : not available (exported frames / '
-                    'placeholder used for non-analysed frames)')
+    if parsed.analysis:
+        analysis_dir = os.path.abspath(os.path.expanduser(parsed.analysis))
+        data_json = os.path.join(analysis_dir, 'data.json')
+        if os.path.isfile(data_json):
+            ViewerHandler.active_dir = analysis_dir
+            tub_dir = parsed.tub
+            if tub_dir is None:
+                with open(data_json) as f:
+                    tub_dir = json.load(f).get('tub')
+            if tub_dir:
+                candidate = os.path.join(os.path.expanduser(tub_dir), 'images')
+                if os.path.isdir(candidate):
+                    ViewerHandler.tub_images_dir = os.path.abspath(candidate)
+        else:
+            logger.warning(f'{analysis_dir} has no data.json yet; starting '
+                           f'in launcher mode instead.')
 
-    handler = partial(ViewerHandler, directory=analysis_dir)
-    server = ThreadingHTTPServer((parsed.host, parsed.port), handler)
+    logger.info(f'Analysis dir : {ViewerHandler.active_dir or "(none yet -- launcher mode)"}')
+    if ViewerHandler.tub_images_dir:
+        logger.info(f'Tub images   : {ViewerHandler.tub_images_dir}')
+
+    server = ThreadingHTTPServer((parsed.host, parsed.port), ViewerHandler)
     shown_host = 'localhost' if parsed.host in ('127.0.0.1', '0.0.0.0') \
         else parsed.host
     print(f'\nUncertainty viewer running at '

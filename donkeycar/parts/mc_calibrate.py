@@ -20,6 +20,16 @@ a displayed percentage using those anchors.
 IMPORTANT: this is a relative, per-model calibration, NOT a formally calibrated
 Bayesian probability. A displayed "90%" means "this frame's uncertainty is low
 *relative to this model's own baseline drive*", nothing more.
+
+The same replay pass also fits calibration statistics for the complementary
+feature-space novelty (out-of-distribution) signal -- see
+``donkeycar.parts.novelty``: per-frame ``dense_2``/``conv2d_5`` features are
+collected alongside the variance, a diagonal Gaussian is fit to each, and
+percentile-anchored novelty-score maps are stored as ``novelty_global``/
+``novelty_spatial`` blocks in the same ``calib.json`` (purely additive --
+older calibrations without these keys still work, novelty just displays as
+unavailable). ``novelty_distance_to_score()`` is the novelty analogue of
+``variance_to_confidence()``.
 """
 import json
 import logging
@@ -43,12 +53,36 @@ _ANCHOR_CONFIDENCE = {
     'max': 5.0,
 }
 
+# Novelty % assigned at each Mahalanobis-distance percentile anchor.
+# Monotonically INCREASING (opposite direction from confidence): low
+# distance from the training distribution -> low novelty (familiar), high
+# distance -> high novelty (unfamiliar).
+_ANCHOR_NOVELTY = {
+    'min': 2.0,
+    'p50': 10.0,
+    'p80': 45.0,
+    'p97': 80.0,
+    'max': 98.0,
+}
+
 
 def build_calibration(smoothed_variances, num_passes, alpha,
-                      percentiles=DEFAULT_PERCENTILES, model_path=None):
+                      percentiles=DEFAULT_PERCENTILES, model_path=None,
+                      dense2_features=None, conv5_features=None):
     """
     Turn a collected distribution of smoothed variances into a calibration
-    dict (JSON-serialisable).
+    dict (JSON-serialisable). Optionally also fits novelty-detection
+    (Mahalanobis distance) statistics from per-frame feature vectors:
+
+    :param dense2_features: optional (n_frames, 50) array of dense_2 layer
+                            outputs, one per calibration frame -- fits the
+                            *global* (whole-image) novelty statistics.
+    :param conv5_features:  optional (n_frames, h, w, 64) array of conv2d_5
+                            layer outputs -- fits the *spatial* novelty
+                            statistics, pooling every grid location across
+                            every frame into one distribution (see
+                            donkeycar.parts.novelty module docstring for the
+                            position-independence trade-off).
     """
     v = np.asarray(smoothed_variances, dtype=np.float64)
     v = v[np.isfinite(v)]
@@ -83,7 +117,54 @@ def build_calibration(smoothed_variances, num_passes, alpha,
         'note': ('Relative per-model uncertainty calibration, NOT a formally '
                  'calibrated probability.'),
     }
+
+    if dense2_features is not None:
+        calib['novelty_global'] = _build_novelty_block(
+            np.asarray(dense2_features, dtype=np.float64), percentiles)
+    if conv5_features is not None:
+        conv5 = np.asarray(conv5_features, dtype=np.float64)
+        # Pool every spatial location across every frame into ONE
+        # distribution -- position-independent, see novelty.py docstring.
+        pooled = conv5.reshape(-1, conv5.shape[-1])
+        calib['novelty_spatial'] = _build_novelty_block(pooled, percentiles)
+
     return calib
+
+
+def _build_novelty_block(feature_matrix, percentiles=DEFAULT_PERCENTILES):
+    """
+    Fit a diagonal Gaussian to `feature_matrix` (n_samples, d) and build a
+    percentile-anchored distance -> novelty-score map, mirroring the
+    confidence calibration's structure but ascending (low distance -> low
+    score, high distance -> high score).
+    """
+    from donkeycar.parts.novelty import fit_diagonal_gaussian, mahalanobis_diag
+
+    stats = fit_diagonal_gaussian(feature_matrix)
+    mean = np.array(stats['mean'])
+    var = np.array(stats['var'])
+    active = np.array(stats['active_dims'])
+    eps = stats['eps']
+
+    distances = mahalanobis_diag(feature_matrix, mean, var, active, eps)
+    p50, p80, p97 = (float(np.percentile(distances, p)) for p in percentiles)
+    dmin, dmax = float(distances.min()), float(distances.max())
+
+    xs = _make_strictly_increasing([dmin, p50, p80, p97, dmax])
+    ys = [_ANCHOR_NOVELTY['min'], _ANCHOR_NOVELTY['p50'],
+          _ANCHOR_NOVELTY['p80'], _ANCHOR_NOVELTY['p97'],
+          _ANCHOR_NOVELTY['max']]
+
+    return {
+        'mean': stats['mean'],
+        'var': stats['var'],
+        'active_dims': stats['active_dims'],
+        'eps': eps,
+        'distance_stats': {'min': dmin, 'max': dmax,
+                           'mean': float(distances.mean()),
+                           'std': float(distances.std())},
+        'score_anchors': {'distance': xs, 'score': ys},
+    }
 
 
 def _make_strictly_increasing(xs, eps=1e-9):
@@ -108,6 +189,17 @@ def variance_to_confidence(variance, calib):
     return float(np.interp(variance, xs, ys))
 
 
+def novelty_distance_to_score(distance, novelty_calib_block):
+    """
+    Map a Mahalanobis distance to a displayed novelty % in [min..max anchor],
+    using a novelty calibration block (calib['novelty_global'] or
+    calib['novelty_spatial']). Monotonically increasing: low distance (looks
+    like training data) -> low novelty %, high distance -> high novelty %.
+    """
+    anchors = novelty_calib_block['score_anchors']
+    return float(np.interp(distance, anchors['distance'], anchors['score']))
+
+
 def default_calib_path(model_path):
     """Calibration file sits next to the model: <model>.calib.json"""
     return os.path.splitext(model_path)[0] + '.calib.json'
@@ -128,13 +220,16 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                        alpha=None, limit=None, percentiles=DEFAULT_PERCENTILES,
                        out_path=None):
     """
-    Replay a tub through the MC-Dropout part, collect smoothed variances, build
+    Replay a tub through the MC-Dropout part, collect smoothed variances plus
+    (for novelty detection) per-frame dense_2/conv2d_5 feature vectors, build
     and save a calibration file. Returns (calib_dict, out_path).
     """
     # Imported here so this module is cheap to import without TF.
     from donkeycar.parts.keras import KerasLinear
     from donkeycar.parts.mc_dropout import MCDropoutConfidence
     from donkeycar.pipeline.types import TubDataset
+    from donkeycar.utils import normalize_image
+    import tensorflow as tf
 
     num_passes = num_passes if num_passes is not None \
         else getattr(cfg, 'MC_DROPOUT_PASSES', 15)
@@ -146,6 +241,15 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     pilot.load(model_path)
     part = MCDropoutConfidence(pilot, num_passes=num_passes, alpha=alpha)
 
+    # One extra, cheap deterministic sub-model reused from the same loaded
+    # Keras model -- feeds the novelty-detection statistics below. A single
+    # forward pass per frame (no dropout stochasticity needed: novelty is a
+    # distance-from-training-distribution measure, not an agreement measure).
+    model = pilot.interpreter.model
+    feat_model = tf.keras.Model(
+        model.inputs,
+        [model.get_layer('dense_2').output, model.get_layer('conv2d_5').output])
+
     tub_paths = [os.path.expanduser(p) for p in tub_paths]
     dataset = TubDataset(config=cfg, tub_paths=tub_paths)
     records = dataset.get_records()
@@ -155,16 +259,26 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                 f'distribution (N={num_passes}, alpha={alpha})...')
 
     smoothed = []
+    dense2_features = []
+    conv5_features = []
     for i, record in enumerate(records):
         img = record.image()  # uint8, already resized to model input size
         # part.run -> (angle, throttle, confidence, raw_var, smoothed_var)
         smooth_var = part.run(img)[4]
         smoothed.append(smooth_var)
+
+        norm = normalize_image(img).astype(np.float32)
+        dense2_out, conv5_out = feat_model(norm[np.newaxis, ...], training=False)
+        dense2_features.append(np.asarray(dense2_out)[0])
+        conv5_features.append(np.asarray(conv5_out)[0])
+
         if (i + 1) % 200 == 0:
             logger.info(f'  {i + 1}/{len(records)} frames')
 
     calib = build_calibration(smoothed, num_passes, alpha,
-                              percentiles=percentiles, model_path=model_path)
+                              percentiles=percentiles, model_path=model_path,
+                              dense2_features=dense2_features,
+                              conv5_features=conv5_features)
     out_path = out_path or default_calib_path(model_path)
     save_calibration(calib, out_path)
     dataset.close()
@@ -187,6 +301,18 @@ def _summary(calib):
                      ('p97', p['p97'])):
         lines.append(f"      variance {v:.6f} -> "
                      f"{variance_to_confidence(v, calib):5.1f}% confidence")
+
+    for key, label in (('novelty_global', 'global (dense_2, 50-dim)'),
+                       ('novelty_spatial', 'spatial (conv2d_5, 64-dim, pooled)')):
+        block = calib.get(key)
+        if not block:
+            continue
+        n_active = int(np.sum(block['active_dims']))
+        n_total = len(block['active_dims'])
+        ds = block['distance_stats']
+        lines.append(f"  novelty {label}:")
+        lines.append(f"      active dims     : {n_active}/{n_total}")
+        lines.append(f"      distance min/max: {ds['min']:.4f} / {ds['max']:.4f}")
     return "\n".join(lines)
 
 

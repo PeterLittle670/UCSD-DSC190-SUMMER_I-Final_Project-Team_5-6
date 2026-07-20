@@ -494,36 +494,61 @@ LEARNING_RATE_DECAY = 0.0
 # Store images as 'ARRAY' (faster), 'BINARY', or 'NOCACHE' (saves RAM).
 CACHE_POLICY = 'ARRAY'
 
-# MC-DROPOUT UNCERTAINTY (enabled at drive time with the --uncertainty flag).
-# Runs the linear model N times per frame with dropout active and reports the
-# variance of the steering predictions as a relative uncertainty signal.
-# NOTE: this is a relative, per-model signal, NOT a calibrated probability.
-# Higher N = smoother estimate but more compute per frame; re-check timing on
-# your target hardware (a Pi is much slower than a desktop).
+# ============================================================
+# EXPLAINABLE AI / UNCERTAINTY TOOLKIT
+# Two independent live signals, each its own on/off switch below. Either,
+# both, or neither can be enabled -- they don't depend on each other, and
+# neither needs any command-line flag. Both need a calibration file
+# (<model>.calib.json, produced by `python -m donkeycar.parts.mc_calibrate`
+# or automatically via MC_DROPOUT_AUTO_CALIBRATE below) to show a % on the
+# dashboard; without one the raw numbers still get logged to the tub.
+# ============================================================
+
+# --- Signal 1: MC-Dropout confidence -------------------------------------
+# Runs the linear model N times per frame with dropout active and reports
+# the variance of the steering predictions as a relative uncertainty signal
+# ("do my dropout sub-networks agree?"). NOT a calibrated probability.
+# Costs N extra forward passes per frame -- the more expensive of the two
+# signals, hence its own explicit toggle.
+USE_MC_DROPOUT_CONFIDENCE = False
 MC_DROPOUT_PASSES = 15      # number of stochastic forward passes per frame
 MC_DROPOUT_ALPHA = 0.2      # EMA smoothing of the variance (0..1, higher=faster)
-# Minimum seconds between uncertainty updates. 0 = every frame (default).
-# E.g. 0.15 updates the confidence ~6-7x/sec; between updates the car still
-# steers every frame via a cheap single-pass inference, only the uncertainty
+# Minimum seconds between confidence updates. 0 = every frame (default).
+# E.g. 0.15 updates confidence ~6-7x/sec; between updates the car still
+# steers every frame via a cheap single-pass inference, only the confidence
 # numbers are held. Reduces average compute load on slow hardware (Pi), at
 # the cost of a periodic slower loop iteration when the N-pass update runs.
 MC_DROPOUT_INTERVAL = 0.0
-# When True, training automatically builds the confidence calibration on the
-# training tubs and saves <model>.calib.json next to the model, so the model
-# ships ready for the --uncertainty dashboard. Adds a replay pass (~minutes),
-# so it is off by default. Linear model only.
+# When True, training automatically builds the confidence (and novelty)
+# calibration on the training tubs and saves <model>.calib.json next to the
+# model, so the model ships ready for the dashboard. Adds a replay pass
+# (~minutes), so it is off by default. Linear model only.
 MC_DROPOUT_AUTO_CALIBRATE = False
 MC_DROPOUT_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
 
-# CONFIDENCE-BASED THROTTLE SCALING (Feature 2). Requires the --uncertainty
-# flag (it consumes the confidence signal). When enabled, the autopilot
-# throttle is scaled down as confidence drops; steering is never affected, and
-# manual driving is unchanged. Disabled -> zero behaviour change.
-USE_CONFIDENCE_THROTTLE_SCALING = False
+# --- Signal 2: feature-space novelty (out-of-distribution) detection -----
+# A single cheap deterministic forward pass per frame measuring how far the
+# current scene's learned features are from the training distribution
+# (Mahalanobis distance) -- "have I seen anything like this?" A different
+# question from confidence above: a frame can be low-confidence yet
+# familiar-looking, or high-confidence yet genuinely novel (confidently
+# wrong). See donkeycar.parts.novelty module docstring for the full picture.
+USE_NOVELTY_DETECTION = False
+NOVELTY_EMA_ALPHA = 0.2     # EMA smoothing of the raw Mahalanobis distance
+
+# --- Throttle scaling (Feature 2) -----------------------------------------
+# Scales autopilot throttle down as confidence drops and/or novelty rises;
+# steering is never affected, and manual driving is unchanged. Takes the
+# more conservative (lowest) scale across whichever of the two signals above
+# are currently enabled and calibrated -- enabling only one of them still
+# works, using that one signal alone. Disabled -> zero behaviour change.
+USE_THROTTLE_SCALING = False
 CONFIDENCE_REDUCED_THRESHOLD = 65.0    # below this confidence %, start scaling
 CONFIDENCE_CRITICAL_THRESHOLD = 25.0   # below this confidence %, critical tier
-CONFIDENCE_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from this signal
-CONFIDENCE_STOP_DURATION = 1.0         # secs sustained-critical before full stop
+NOVELTY_REDUCED_THRESHOLD = 25.0       # above this novelty %, start scaling
+NOVELTY_CRITICAL_THRESHOLD = 65.0      # above this novelty %, critical tier
+CONFIDENCE_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from either signal alone
+CONFIDENCE_STOP_DURATION = 1.0         # secs sustained-critical (either signal) before full stop
 
 # MODEL OPTIMIZATION
 # Automatically create TFLite model for faster inference on Pi.
