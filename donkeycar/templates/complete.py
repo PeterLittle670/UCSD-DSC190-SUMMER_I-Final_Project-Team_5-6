@@ -478,30 +478,61 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                   run_condition='run_pilot')
 
         #
-        # Feature 2: scale throttle down as confidence drops and/or novelty
-        # rises. Only reduces throttle, never touches steering. Takes the
-        # more conservative (lowest) scale across whichever signal(s) are
-        # currently enabled and calibrated; a disabled or uncalibrated
-        # signal is ignored rather than blocking the other one.
+        # Signal 3: test-time augmentation (TTA) stability. Independent of the
+        # two signals above (its own config toggle) -- a pure auxiliary
+        # observer (like novelty) that runs the deterministic model on M
+        # photometrically-augmented copies of the frame and reports the
+        # steering-prediction variance as a robustness signal. Rides alongside
+        # whichever part drives; never produces steering/throttle.
+        #
+        use_tta = getattr(cfg, 'XAI_TTA_ENABLED', False)
+        if use_tta:
+            from donkeycar.parts.tta import TTAStabilityDetector
+            from donkeycar.parts.mc_calibrate import default_calib_path
+            tta_calib_path = default_calib_path(model_path)
+            if not os.path.exists(tta_calib_path):
+                logger.warning(f"No calibration found at {tta_calib_path}; run "
+                               f"'python -m donkeycar.parts.mc_calibrate' with "
+                               f"XAI_TTA_ENABLED=True to enable the stability %.")
+                tta_calib_path = None
+            logger.info("Enabling test-time augmentation (TTA) stability")
+            tta_part = TTAStabilityDetector(
+                kl, calibration_path=tta_calib_path,
+                num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
+                alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2),
+                strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2))
+            V.add(tta_part, inputs=[inputs[0]],
+                  outputs=['pilot/tta_stability', 'pilot/raw_tta_variance',
+                           'pilot/smoothed_tta_variance'],
+                  run_condition='run_pilot')
+
+        #
+        # Feature 2: scale throttle down as confidence drops, novelty rises,
+        # and/or TTA stability drops. Only reduces throttle, never touches
+        # steering. Takes the more conservative (lowest) scale across whichever
+        # signal(s) are currently enabled and calibrated; a disabled or
+        # uncalibrated signal is ignored rather than blocking the others.
         #
         if getattr(cfg, 'XAI_THROTTLE_SCALING_ENABLED', False):
-            if not use_mc_dropout and not use_novelty:
-                logger.warning("XAI_THROTTLE_SCALING_ENABLED is set but neither "
-                               "XAI_CONFIDENCE_ENABLED nor "
-                               "XAI_NOVELTY_ENABLED is enabled; throttle "
-                               "scaling has no signal to act on and will be "
-                               "inactive.")
+            if not use_mc_dropout and not use_novelty and not use_tta:
+                logger.warning("XAI_THROTTLE_SCALING_ENABLED is set but none of "
+                               "XAI_CONFIDENCE_ENABLED / XAI_NOVELTY_ENABLED / "
+                               "XAI_TTA_ENABLED is enabled; throttle scaling "
+                               "has no signal to act on and will be inactive.")
             from donkeycar.parts.mc_dropout import ThrottleScaler
-            logger.info("Enabling confidence/novelty-based throttle scaling")
+            logger.info("Enabling confidence/novelty/TTA-based throttle scaling")
             throttle_scaler = ThrottleScaler(
                 confidence_reduced_threshold=getattr(cfg, 'XAI_CONFIDENCE_REDUCED_THRESHOLD', 65.0),
                 confidence_critical_threshold=getattr(cfg, 'XAI_CONFIDENCE_CRITICAL_THRESHOLD', 25.0),
                 novelty_reduced_threshold=getattr(cfg, 'XAI_NOVELTY_REDUCED_THRESHOLD', 25.0),
                 novelty_critical_threshold=getattr(cfg, 'XAI_NOVELTY_CRITICAL_THRESHOLD', 65.0),
+                tta_reduced_threshold=getattr(cfg, 'XAI_TTA_REDUCED_THRESHOLD', 65.0),
+                tta_critical_threshold=getattr(cfg, 'XAI_TTA_CRITICAL_THRESHOLD', 25.0),
                 min_scale=getattr(cfg, 'XAI_THROTTLE_MIN_SCALE', 0.4),
                 stop_duration=getattr(cfg, 'XAI_THROTTLE_STOP_DURATION', 1.0))
             V.add(throttle_scaler,
-                  inputs=['pilot/throttle', 'pilot/confidence', 'pilot/novelty'],
+                  inputs=['pilot/throttle', 'pilot/confidence', 'pilot/novelty',
+                          'pilot/tta_stability'],
                   outputs=['pilot/throttle'],
                   run_condition='run_pilot')
 
@@ -627,6 +658,13 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
     if getattr(cfg, 'XAI_NOVELTY_ENABLED', False):
         inputs += ['pilot/novelty', 'pilot/raw_novelty_distance',
                    'pilot/smoothed_novelty_distance']
+        types += ['float', 'float', 'float']
+
+    # Log the TTA stability signal too, independent of the others -- input for
+    # the offline analysis timeline.
+    if getattr(cfg, 'XAI_TTA_ENABLED', False):
+        inputs += ['pilot/tta_stability', 'pilot/raw_tta_variance',
+                   'pilot/smoothed_tta_variance']
         types += ['float', 'float', 'float']
 
     if cfg.HAVE_PERFMON:
@@ -800,7 +838,7 @@ def add_user_controller(V, cfg, use_joystick, input_image='ui/image_array'):
     ctr = LocalWebController(port=cfg.WEB_CONTROL_PORT, mode=cfg.WEB_INIT_MODE)
     V.add(ctr,
           inputs=[input_image, 'tub/num_records', 'user/mode', 'recording',
-                  'pilot/confidence', 'pilot/novelty'],
+                  'pilot/confidence', 'pilot/novelty', 'pilot/tta_stability'],
           outputs=['user/steering', 'user/throttle', 'user/mode', 'recording', 'web/buttons'],
           threaded=True)
 

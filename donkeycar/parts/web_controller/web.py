@@ -125,6 +125,8 @@ class LocalWebController(tornado.web.Application):
         self.last_confidence_pct = None   # last value pushed to clients
         self.novelty = None                # last novelty (OOD) % (or None)
         self.last_novelty_pct = None       # last value pushed to clients
+        self.tta_stability = None          # last TTA stability % (or None)
+        self.last_tta_pct = None           # last value pushed to clients
         self.wsclients = []
         self.loop = None
 
@@ -167,7 +169,8 @@ class LocalWebController(tornado.web.Application):
                     pass
 
     def run_threaded(self, img_arr=None, num_records=0, mode=None,
-                     recording=None, confidence=None, novelty=None):
+                     recording=None, confidence=None, novelty=None,
+                     tta_stability=None):
         """
         :param img_arr: current camera image or None
         :param num_records: current number of data records
@@ -177,6 +180,8 @@ class LocalWebController(tornado.web.Application):
                            feature is disabled / the model is uncalibrated
         :param novelty: feature-space novelty (OOD) % (0-100) or None if the
                         feature is disabled / the model is uncalibrated
+        :param tta_stability: test-time-augmentation stability % (0-100) or
+                        None if the feature is disabled / model uncalibrated
         """
         self.img_arr = img_arr
         self.num_records = num_records
@@ -222,6 +227,14 @@ class LocalWebController(tornado.web.Application):
                 self.last_novelty_pct = nov_pct
                 changes['novelty'] = nov_pct
 
+        # Push TTA stability score the same throttled way.
+        self.tta_stability = tta_stability
+        if tta_stability is not None:
+            tta_pct = int(round(tta_stability))
+            if tta_pct != self.last_tta_pct:
+                self.last_tta_pct = tta_pct
+                changes['tta_stability'] = tta_pct
+
         #
         # get latched button presses then clear button presses
         # Next iteration will clear press in memory
@@ -240,9 +253,9 @@ class LocalWebController(tornado.web.Application):
         return self.angle, self.throttle, self.mode, self.recording, buttons
 
     def run(self, img_arr=None, num_records=0, mode=None, recording=None,
-            confidence=None, novelty=None):
+            confidence=None, novelty=None, tta_stability=None):
         return self.run_threaded(img_arr, num_records, mode, recording,
-                                 confidence, novelty)
+                                 confidence, novelty, tta_stability)
 
     def shutdown(self):
         pass

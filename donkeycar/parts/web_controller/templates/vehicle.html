@@ -96,6 +96,24 @@
             </small>
           </div>
         </div>
+
+        <!-- test-time augmentation stability, only shown when XAI_TTA_ENABLED is on -->
+        <div id="tta-panel" class="panel panel-default" style="display: none; clear: both; margin-top: 15px;">
+          <div class="panel-heading">
+            <strong>TTA stability</strong>
+            <span id="tta-value" class="pull-right"></span>
+          </div>
+          <div class="panel-body">
+            <div class="progress" id="tta-progress" style="margin-bottom: 8px;">
+              <div id="tta-bar" class="progress-bar progress-bar-success"
+                   role="progressbar" style="width: 0%;"></div>
+            </div>
+            <small class="text-muted">
+              Robustness of the prediction to lighting/noise perturbation
+              &mdash; high = stable. A different signal from the two above.
+            </small>
+          </div>
+        </div>
       </div> <!-- end video column -->
 
       <div id="joystick-column"  class="col-md-6">

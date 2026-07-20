@@ -19,6 +19,7 @@ var driveHandler = new function() {
         'session': 'None',
         'confidence': null,   // MC-Dropout confidence %, null when disabled
         'novelty': null,      // feature-space novelty (OOD) %, null when disabled
+        'tta_stability': null, // TTA stability %, null when disabled
         'lag': 0,
         'controlMode': 'joystick',
         'maxThrottle' : 1,
@@ -263,6 +264,21 @@ var driveHandler = new function() {
           .css('width', nov + '%')
           .removeClass('progress-bar-success progress-bar-warning progress-bar-danger')
           .addClass(novClass);
+      }
+
+      // TTA stability meter (only present when XAI_TTA_ENABLED is on). Tier
+      // colors match confidence (high = good): stable = green, fragile = red.
+      if (state.tta_stability !== null && state.tta_stability !== undefined) {
+        var tta = Math.max(0, Math.min(100, Math.round(state.tta_stability)));
+        var ttaClass = tta >= 65 ? 'progress-bar-success'
+                     : tta >= 25 ? 'progress-bar-warning'
+                     : 'progress-bar-danger';
+        $('#tta-panel').show();
+        $('#tta-value').html(tta + '%');
+        $('#tta-bar')
+          .css('width', tta + '%')
+          .removeClass('progress-bar-success progress-bar-warning progress-bar-danger')
+          .addClass(ttaClass);
       }
 
       if(state.tele.user.throttle < 0) {

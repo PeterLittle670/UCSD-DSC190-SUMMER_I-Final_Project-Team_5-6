@@ -536,6 +536,21 @@ XAI_CONFIDENCE_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=
 XAI_NOVELTY_ENABLED = False   # master on/off for the novelty signal
 XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
 
+# --- Signal 3: test-time augmentation (TTA) stability --------------------
+# Runs the DETERMINISTIC model on M photometrically-augmented copies of the
+# frame and reports the variance of the steering predictions as a "stability"
+# signal ("does my answer stay the same if the lighting/noise changes a
+# little?"). A third, distinct question from the two above: confidence probes
+# the model's weights, novelty probes the scene, TTA probes robustness to
+# input perturbation. Photometric augmentation only (brightness/contrast/gamma
+# /noise) -- never geometric, which would change the correct steering answer.
+# M forward passes batched into one call, cheap enough for live use. Needs a
+# calibration with a "tta" block (recalibrate with this ON to add it).
+XAI_TTA_ENABLED = False       # master on/off for the TTA stability signal
+XAI_TTA_SAMPLES = 8           # M, number of augmented copies per frame
+XAI_TTA_ALPHA = 0.2           # EMA smoothing of the steering variance
+XAI_TTA_STRENGTH = 0.2        # photometric jitter strength (0..1); 0 = no augmentation
+
 # --- Throttle scaling (Feature 2) -----------------------------------------
 # Scales autopilot throttle down as confidence drops and/or novelty rises;
 # steering is never affected, and manual driving is unchanged. Takes the
@@ -547,8 +562,10 @@ XAI_CONFIDENCE_REDUCED_THRESHOLD = 65.0    # below this confidence %, start scal
 XAI_CONFIDENCE_CRITICAL_THRESHOLD = 25.0   # below this confidence %, critical tier
 XAI_NOVELTY_REDUCED_THRESHOLD = 25.0       # above this novelty %, start scaling
 XAI_NOVELTY_CRITICAL_THRESHOLD = 65.0      # above this novelty %, critical tier
-XAI_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from either signal alone
-XAI_THROTTLE_STOP_DURATION = 1.0   # secs sustained-critical (either signal) before full stop
+XAI_TTA_REDUCED_THRESHOLD = 65.0           # below this stability %, start scaling
+XAI_TTA_CRITICAL_THRESHOLD = 25.0          # below this stability %, critical tier
+XAI_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from any single signal
+XAI_THROTTLE_STOP_DURATION = 1.0   # secs sustained-critical (any signal) before full stop
 
 # --- Offline analysis (Grad-CAM tool) -------------------------------------
 # These only affect the offline post-drive analysis tool

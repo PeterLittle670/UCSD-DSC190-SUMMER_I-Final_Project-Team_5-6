@@ -1,0 +1,185 @@
+"""
+Test-Time Augmentation (TTA) stability -- a third live uncertainty signal.
+
+MC-Dropout confidence (``donkeycar.parts.mc_dropout``) perturbs the model's
+*weights* (dropout masks) and asks "do my sub-networks agree?". Novelty
+(``donkeycar.parts.novelty``) perturbs nothing and asks "does this scene look
+like training data?". TTA perturbs the *input image* and asks a third,
+distinct question: "does my answer stay the same if the picture changes a
+little?" -- i.e. robustness of the prediction to input noise, which neither of
+the other two signals measures directly.
+
+Mechanism: run the DETERMINISTIC model (dropout OFF, same weights every time)
+on M lightly-augmented copies of the frame, and take the variance of the M
+steering predictions. Low variance = the prediction is stable under input
+perturbation = robust; high variance = fragile. The variance is EMA-smoothed
+and mapped through the model's calibration to a 0-100 "stability %" (high =
+robust), mirroring the confidence signal's machinery but with its own
+calibration block (``calib['tta']``).
+
+CRITICAL -- photometric augmentations ONLY. We perturb brightness, contrast,
+gamma, and add a little gaussian noise: changes that do NOT move the road in
+the image, so the *correct* steering answer is unchanged and any wobble in the
+prediction is genuinely the model being fragile. We deliberately do NOT use
+rotation / horizontal flip / large translation: those change the correct
+answer (a flipped road really does turn the other way), which would conflate
+"model is fragile" with "the scene genuinely changed". This keeps TTA a clean
+"robustness to camera/lighting noise" signal. (Geometric TTA would require
+applying the inverse transform to the output -- out of scope here.)
+
+Like ``FeatureNoveltyDetector``, this is a pure auxiliary observer: it does
+NOT produce steering/throttle and rides alongside whichever part drives the
+car. M forward passes are batched into ONE deterministic call (same trick as
+MC-Dropout), so it is cheap enough to run live.
+
+Model scope: like the rest of this toolkit, the default linear architecture
+(``KerasLinear``) with a single image input and a callable Keras interpreter
+-- not TFLite/TensorRT.
+"""
+import logging
+
+import numpy as np
+import tensorflow as tf
+
+from donkeycar.utils import normalize_image
+
+logger = logging.getLogger(__name__)
+
+
+def photometric_batch(norm_img, num_samples, strength, rng):
+    """
+    Build a batch of ``num_samples`` photometrically-augmented copies of a
+    normalised image. Geometry is untouched (no spatial transform), so the
+    correct steering answer is identical for every copy -- see the module
+    docstring for why that matters.
+
+    :param norm_img:    (H, W, C) float32 image in [0, 1].
+    :param num_samples: M, the number of augmented copies.
+    :param strength:    augmentation strength; brightness/contrast/gamma are
+                        each jittered within +/- this fraction, gaussian noise
+                        std is ``strength * 0.1``. 0 -> all copies identical.
+    :param rng:         a ``numpy.random.Generator``.
+    :return:            (M, H, W, C) float32 batch in [0, 1].
+    """
+    M = int(num_samples)
+    imgs = np.repeat(norm_img[np.newaxis, ...], M, axis=0).astype(np.float32)
+
+    # Per-sample photometric parameters, shaped to broadcast over (H, W, C).
+    bright = rng.uniform(-strength, strength, (M, 1, 1, 1)).astype(np.float32)
+    contrast = (1.0 + rng.uniform(-strength, strength,
+                                  (M, 1, 1, 1))).astype(np.float32)
+    gamma = (1.0 + rng.uniform(-strength, strength,
+                               (M, 1, 1, 1))).astype(np.float32)
+
+    # Contrast about each image's own mean, then a brightness shift.
+    mean = imgs.mean(axis=(1, 2, 3), keepdims=True)
+    imgs = (imgs - mean) * contrast + mean
+    imgs = imgs + bright
+    imgs = np.clip(imgs, 0.0, 1.0)
+    # Gamma (safe on [0, 1]; gamma stays positive for strength < 1).
+    imgs = np.power(imgs, gamma)
+    # A little gaussian sensor noise.
+    if strength > 0:
+        imgs = imgs + rng.normal(0.0, strength * 0.1, imgs.shape).astype(np.float32)
+    return np.clip(imgs, 0.0, 1.0)
+
+
+class TTAStabilityDetector:
+    """
+    DonkeyCar Part. Computes a live "stability" score per frame: the variance
+    of the deterministic model's steering prediction across M photometrically
+    -augmented copies of the frame, EMA-smoothed and mapped to a 0-100 % (high
+    = robust) via the model's ``calib['tta']`` block.
+
+    Pure auxiliary observer (like ``FeatureNoveltyDetector``): does NOT drive.
+
+    Run signature::
+
+        stability, raw_variance, smoothed_variance = part.run(img_arr)
+
+    ``stability`` is a 0-100 % (high = robust), or ``None`` if the model has no
+    calibration, or a calibration made before TTA stats existed.
+
+    :param pilot:            a loaded KerasPilot (KerasLinear); its underlying
+                             Keras model is reused directly.
+    :param calibration_path: path to a ``<model>.calib.json``. Optional.
+    :param num_samples:      M, number of augmented copies per frame (~8).
+    :param alpha:            EMA smoothing factor in [0, 1] for the variance.
+    :param strength:         photometric augmentation strength (see
+                             ``photometric_batch``).
+    :param seed:             optional RNG seed for reproducible augmentations.
+    """
+
+    def __init__(self, pilot, calibration_path=None, num_samples=8,
+                 alpha=0.2, strength=0.2, seed=None):
+        self.num_samples = int(num_samples)
+        self.alpha = float(alpha)
+        self.strength = float(strength)
+        self.rng = np.random.default_rng(seed)
+        self.smoothed_variance = None
+
+        interpreter = getattr(pilot, 'interpreter', None)
+        self.model = getattr(interpreter, 'model', None)
+        if self.model is None or not callable(self.model):
+            raise ValueError(
+                'TTAStabilityDetector requires a Keras pilot with a callable '
+                'model (the default KerasInterpreter). TFLite/TensorRT '
+                'interpreters are not supported.')
+        self.input_keys = list(interpreter.input_keys)
+        if len(self.input_keys) > 1:
+            logger.warning(
+                'TTAStabilityDetector: model has multiple inputs %s; TTA '
+                'supports single-image-input (linear) models only. Using the '
+                'first input, others left unset may error.', self.input_keys)
+
+        self.calibration = None
+        if calibration_path:
+            try:
+                from donkeycar.parts.mc_calibrate import load_calibration
+                calib = load_calibration(calibration_path)
+                self.calibration = calib.get('tta')
+                if self.calibration is None:
+                    logger.warning(
+                        f'TTAStabilityDetector: {calibration_path} has no '
+                        f'"tta" stats (calibration made before TTA, or with '
+                        f'XAI_TTA_ENABLED off); stability will be unavailable '
+                        f'-- re-run mc_calibrate with XAI_TTA_ENABLED=True.')
+                else:
+                    logger.info(f'TTAStabilityDetector: loaded TTA calibration '
+                                f'from {calibration_path}')
+            except Exception as e:
+                logger.warning(f'TTAStabilityDetector: could not load '
+                               f'calibration {calibration_path} ({e}); '
+                               f'stability will be unavailable.')
+
+    def run(self, img_arr):
+        if img_arr is None:
+            return self._score(), 0.0, (self.smoothed_variance or 0.0)
+
+        norm = normalize_image(img_arr).astype(np.float32)
+        batch = photometric_batch(norm, self.num_samples, self.strength,
+                                  self.rng)
+        input_dict = {self.input_keys[0]: tf.convert_to_tensor(batch)}
+        outputs = self.model(input_dict, training=False)   # DETERMINISTIC
+        # Linear model returns [angle (M,1), throttle (M,1)].
+        angle_samples = np.asarray(outputs[0]).reshape(-1)
+        raw_variance = float(np.var(angle_samples))
+
+        if self.smoothed_variance is None:
+            self.smoothed_variance = raw_variance
+        else:
+            self.smoothed_variance = (
+                self.alpha * raw_variance
+                + (1.0 - self.alpha) * self.smoothed_variance)
+
+        return self._score(), raw_variance, self.smoothed_variance
+
+    def _score(self):
+        if self.calibration is None or self.smoothed_variance is None:
+            return None
+        from donkeycar.parts.mc_calibrate import tta_variance_to_stability
+        return tta_variance_to_stability(self.smoothed_variance,
+                                         self.calibration)
+
+    def shutdown(self):
+        pass

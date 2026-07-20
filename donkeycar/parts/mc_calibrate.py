@@ -68,7 +68,9 @@ _ANCHOR_NOVELTY = {
 
 def build_calibration(smoothed_variances, num_passes, alpha,
                       percentiles=DEFAULT_PERCENTILES, model_path=None,
-                      dense2_features=None, conv5_features=None):
+                      dense2_features=None, conv5_features=None,
+                      tta_variances=None, tta_num_samples=None,
+                      tta_strength=None, tta_alpha=None):
     """
     Turn a collected distribution of smoothed variances into a calibration
     dict (JSON-serialisable). Optionally also fits novelty-detection
@@ -83,6 +85,9 @@ def build_calibration(smoothed_variances, num_passes, alpha,
                             every frame into one distribution (see
                             donkeycar.parts.novelty module docstring for the
                             position-independence trade-off).
+    :param tta_variances:   optional list of per-frame test-time-augmentation
+                            steering variances -- fits the ``tta`` stability
+                            calibration block (see donkeycar.parts.tta).
     """
     v = np.asarray(smoothed_variances, dtype=np.float64)
     v = v[np.isfinite(v)]
@@ -127,8 +132,48 @@ def build_calibration(smoothed_variances, num_passes, alpha,
         # distribution -- position-independent, see novelty.py docstring.
         pooled = conv5.reshape(-1, conv5.shape[-1])
         calib['novelty_spatial'] = _build_novelty_block(pooled, percentiles)
+    if tta_variances is not None:
+        calib['tta'] = _build_tta_block(
+            tta_variances, tta_num_samples, tta_strength, tta_alpha,
+            percentiles)
 
     return calib
+
+
+def _build_tta_block(tta_variances, num_samples, strength, alpha,
+                     percentiles=DEFAULT_PERCENTILES):
+    """
+    Build the TTA (test-time augmentation) stability calibration block from a
+    distribution of per-frame TTA steering variances. Mirrors the confidence
+    calibration exactly (descending variance -> stability % map), with its own
+    anchors, so ``tta_variance_to_stability`` reads standing within this
+    model's own TTA-variance distribution.
+    """
+    v = np.asarray(tta_variances, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        raise ValueError('No TTA variance samples collected for calibration.')
+
+    p50, p80, p97 = (float(np.percentile(v, p)) for p in percentiles)
+    vmin, vmax = float(v.min()), float(v.max())
+    xs = _make_strictly_increasing([vmin, p50, p80, p97, vmax])
+    # Reuse the confidence anchor levels: low variance -> high stability.
+    ys = [_ANCHOR_CONFIDENCE['min'], _ANCHOR_CONFIDENCE['p50'],
+          _ANCHOR_CONFIDENCE['p80'], _ANCHOR_CONFIDENCE['p97'],
+          _ANCHOR_CONFIDENCE['max']]
+
+    return {
+        'num_samples': int(num_samples),
+        'strength': float(strength),
+        'alpha': float(alpha),
+        'n_frames': int(v.size),
+        'percentiles': {'p50': p50, 'p80': p80, 'p97': p97},
+        'variance_stats': {'min': vmin, 'max': vmax,
+                           'mean': float(v.mean()), 'std': float(v.std())},
+        'stability_anchors': {'variance': xs, 'stability': ys},
+        'note': ('Robustness of the prediction to photometric input '
+                 'perturbation. Relative per-model signal, not a probability.'),
+    }
 
 
 def _build_novelty_block(feature_matrix, percentiles=DEFAULT_PERCENTILES):
@@ -200,6 +245,17 @@ def novelty_distance_to_score(distance, novelty_calib_block):
     return float(np.interp(distance, anchors['distance'], anchors['score']))
 
 
+def tta_variance_to_stability(variance, tta_calib_block):
+    """
+    Map a (smoothed) TTA steering variance to a displayed stability % using the
+    tta block's anchors (calib['tta']). Same descending-interp machinery as
+    ``variance_to_confidence`` -- low variance (prediction is robust to input
+    perturbation) -> high stability %, high variance -> low stability %.
+    """
+    anchors = tta_calib_block['stability_anchors']
+    return float(np.interp(variance, anchors['variance'], anchors['stability']))
+
+
 def default_calib_path(model_path):
     """Calibration file sits next to the model: <model>.calib.json"""
     return os.path.splitext(model_path)[0] + '.calib.json'
@@ -241,6 +297,22 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     pilot.load(model_path)
     part = MCDropoutConfidence(pilot, num_passes=num_passes, alpha=alpha)
 
+    # Optional TTA (test-time augmentation) stability calibration -- only when
+    # enabled, since it adds M deterministic forward passes per frame. Reuses
+    # the same loaded pilot; collects per-frame TTA steering variance below.
+    tta_enabled = getattr(cfg, 'XAI_TTA_ENABLED', False)
+    tta_part = None
+    if tta_enabled:
+        from donkeycar.parts.tta import TTAStabilityDetector
+        tta_samples = getattr(cfg, 'XAI_TTA_SAMPLES', 8)
+        tta_strength = getattr(cfg, 'XAI_TTA_STRENGTH', 0.2)
+        tta_alpha = getattr(cfg, 'XAI_TTA_ALPHA', 0.2)
+        tta_part = TTAStabilityDetector(
+            pilot, num_samples=tta_samples, alpha=tta_alpha,
+            strength=tta_strength, seed=0)
+        logger.info(f'Also collecting TTA stability stats '
+                    f'(M={tta_samples}, strength={tta_strength}).')
+
     # One extra, cheap deterministic sub-model reused from the same loaded
     # Keras model -- feeds the novelty-detection statistics below. A single
     # forward pass per frame (no dropout stochasticity needed: novelty is a
@@ -261,6 +333,7 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     smoothed = []
     dense2_features = []
     conv5_features = []
+    tta_variances = [] if tta_enabled else None
     for i, record in enumerate(records):
         img = record.image()  # uint8, already resized to model input size
         # part.run -> (angle, throttle, confidence, raw_var, smoothed_var)
@@ -272,13 +345,25 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         dense2_features.append(np.asarray(dense2_out)[0])
         conv5_features.append(np.asarray(conv5_out)[0])
 
+        if tta_part is not None:
+            # tta_part.run -> (stability, raw_var, smoothed_var)
+            tta_variances.append(tta_part.run(img)[2])
+
         if (i + 1) % 200 == 0:
             logger.info(f'  {i + 1}/{len(records)} frames')
 
+    tta_kwargs = {}
+    if tta_enabled:
+        tta_kwargs = dict(
+            tta_variances=tta_variances,
+            tta_num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
+            tta_strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2),
+            tta_alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2))
     calib = build_calibration(smoothed, num_passes, alpha,
                               percentiles=percentiles, model_path=model_path,
                               dense2_features=dense2_features,
-                              conv5_features=conv5_features)
+                              conv5_features=conv5_features,
+                              **tta_kwargs)
     out_path = out_path or default_calib_path(model_path)
     save_calibration(calib, out_path)
     dataset.close()
@@ -313,6 +398,19 @@ def _summary(calib):
         lines.append(f"  novelty {label}:")
         lines.append(f"      active dims     : {n_active}/{n_total}")
         lines.append(f"      distance min/max: {ds['min']:.4f} / {ds['max']:.4f}")
+
+    tta = calib.get('tta')
+    if tta:
+        tp = tta['percentiles']
+        ts = tta['variance_stats']
+        lines.append(f"  TTA stability (M={tta['num_samples']}, "
+                     f"strength={tta['strength']}):")
+        lines.append(f"      variance min/max: {ts['min']:.6f} / {ts['max']:.6f}")
+        lines.append(f"      p50 / p80 / p97 : {tp['p50']:.6f} / "
+                     f"{tp['p80']:.6f} / {tp['p97']:.6f}")
+        for label, v in (('median (p50)', tp['p50']), ('p97', tp['p97'])):
+            lines.append(f"      variance {v:.6f} -> "
+                         f"{tta_variance_to_stability(v, tta):5.1f}% stability")
     return "\n".join(lines)
 
 

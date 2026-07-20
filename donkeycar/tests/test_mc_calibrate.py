@@ -4,7 +4,7 @@ import numpy as np
 
 from donkeycar.parts.mc_calibrate import (
     build_calibration, variance_to_confidence, novelty_distance_to_score,
-    _make_strictly_increasing,
+    tta_variance_to_stability, _make_strictly_increasing,
 )
 
 
@@ -61,6 +61,43 @@ class TestNoveltyCalibration(unittest.TestCase):
         calib = build_calibration(variances, num_passes=15, alpha=0.2)
         self.assertNotIn('novelty_global', calib)
         self.assertNotIn('novelty_spatial', calib)
+
+
+class TestTTACalibration(unittest.TestCase):
+
+    def setUp(self):
+        rng = np.random.default_rng(11)
+        variances = rng.gamma(shape=2.0, scale=0.01, size=500)
+        tta_variances = rng.gamma(shape=2.0, scale=1e-4, size=500)
+        self.calib = build_calibration(variances, num_passes=15, alpha=0.2,
+                                       tta_variances=tta_variances,
+                                       tta_num_samples=8, tta_strength=0.2,
+                                       tta_alpha=0.2)
+        self.block = self.calib['tta']
+
+    def test_tta_block_is_built_with_metadata(self):
+        self.assertIn('tta', self.calib)
+        self.assertEqual(self.block['num_samples'], 8)
+        self.assertEqual(self.block['strength'], 0.2)
+
+    def test_stability_is_monotonically_decreasing_with_variance(self):
+        xs = self.block['stability_anchors']['variance']
+        samples = np.linspace(xs[0], xs[-1], 50)
+        scores = [tta_variance_to_stability(v, self.block) for v in samples]
+        for a, b in zip(scores, scores[1:]):
+            self.assertGreaterEqual(a, b - 1e-9)
+
+    def test_stability_clamps_outside_anchor_range(self):
+        below = tta_variance_to_stability(-1.0, self.block)
+        above = tta_variance_to_stability(1e6, self.block)
+        self.assertAlmostEqual(below, 99.0, places=6)  # min-variance anchor
+        self.assertAlmostEqual(above, 5.0, places=6)   # max-variance anchor
+
+    def test_no_tta_variances_means_no_tta_block(self):
+        rng = np.random.default_rng(12)
+        calib = build_calibration(rng.gamma(2.0, 0.01, 100), num_passes=15,
+                                  alpha=0.2)
+        self.assertNotIn('tta', calib)
 
 
 class TestMakeStrictlyIncreasing(unittest.TestCase):

@@ -198,43 +198,45 @@ class MCDropoutConfidence:
 
 class ThrottleScaler:
     """
-    Feature 2: scale the pilot throttle down as MC-Dropout confidence drops
-    and/or feature-space novelty rises. The philosophy is "hesitate, don't
-    guess": this only ever reduces throttle magnitude and NEVER touches
-    steering.
+    Feature 2: scale the pilot throttle down as MC-Dropout confidence drops,
+    feature-space novelty rises, and/or TTA stability drops. The philosophy is
+    "hesitate, don't guess": this only ever reduces throttle magnitude and
+    NEVER touches steering.
 
-    Each signal has its own reduced/critical thresholds (confidence is a
-    "high is good" signal, novelty a "high is bad" one -- see
-    ``donkeycar.parts.novelty`` for why these are complementary, not
-    redundant). On any frame, each available signal is converted to a scale
-    in ``[min_scale, 1.0]`` independently, and the **lower** (more
-    conservative) of the two is applied -- so a problem flagged by either
-    signal alone is enough to ease off the throttle, matching the intent
-    that either failure mode (model disagreement, or a genuinely unfamiliar
-    scene) warrants caution. A signal that's unavailable (feature disabled
-    upstream, or model uncalibrated) is simply excluded from the
-    comparison -- enabling only one of the two signals still works,
-    scaling on that signal alone.
+    Each signal has its own reduced/critical thresholds (confidence and TTA
+    stability are "high is good" signals, novelty a "high is bad" one -- see
+    ``donkeycar.parts.novelty`` / ``donkeycar.parts.tta`` for why the three are
+    complementary, not redundant). On any frame, each available signal is
+    converted to a scale in ``[min_scale, 1.0]`` independently, and the
+    **lower** (most conservative) is applied -- so a problem flagged by any one
+    signal alone is enough to ease off the throttle, matching the intent that
+    any failure mode (model disagreement, an unfamiliar scene, or fragility to
+    input noise) warrants caution. A signal that's unavailable (feature
+    disabled upstream, or model uncalibrated) is simply excluded from the
+    comparison -- enabling only one of the three still works, scaling on that
+    signal alone.
 
-    Per-signal tiers (mirrored between the two, thresholds configurable):
-      * confidence >= confidence_reduced_threshold, or
-        novelty <= novelty_reduced_threshold -> that signal contributes full
-        scale (1.0), unchanged.
+    Per-signal tiers (mirrored across the three, thresholds configurable):
+      * confidence/TTA >= its reduced_threshold, or novelty <= its
+        reduced_threshold -> that signal contributes full scale (1.0).
       * between its reduced/critical thresholds -> that signal's scale is
         linearly interpolated between 1.0 and ``min_scale``.
-      * confidence < confidence_critical_threshold, or
-        novelty > novelty_critical_threshold -> that signal is "critical":
-        contributes ``min_scale``, and if *any* signal has been
-        continuously critical for ``stop_duration`` seconds, throttle is
-        forced to zero (stop).
+      * confidence/TTA < its critical_threshold, or novelty > its
+        critical_threshold -> that signal is "critical": contributes
+        ``min_scale``, and if *any* signal has been continuously critical for
+        ``stop_duration`` seconds, throttle is forced to zero (stop).
 
     Passthrough (no change to throttle) when:
       * throttle is None, or
-      * both confidence and novelty are None (nothing to act on).
+      * all of confidence, novelty and tta_stability are None.
 
     Run signature::
 
-        scaled_throttle = part.run(throttle, confidence, novelty)
+        scaled_throttle = part.run(throttle, confidence, novelty, tta_stability)
+
+    ``tta_stability`` is optional (defaults None) and, like confidence, is a
+    "high is good" signal. Any signal that is None (feature off / uncalibrated)
+    is excluded from the min-of-scales comparison rather than blocking it.
 
     Intended to be added with ``run_condition='run_pilot'`` so it only affects
     autopilot throttle, giving zero behaviour change to manual driving.
@@ -244,11 +246,15 @@ class ThrottleScaler:
                  confidence_critical_threshold=25.0,
                  novelty_reduced_threshold=25.0,
                  novelty_critical_threshold=65.0,
+                 tta_reduced_threshold=65.0,
+                 tta_critical_threshold=25.0,
                  min_scale=0.4, stop_duration=1.0):
         self.confidence_reduced_threshold = float(confidence_reduced_threshold)
         self.confidence_critical_threshold = float(confidence_critical_threshold)
         self.novelty_reduced_threshold = float(novelty_reduced_threshold)
         self.novelty_critical_threshold = float(novelty_critical_threshold)
+        self.tta_reduced_threshold = float(tta_reduced_threshold)
+        self.tta_critical_threshold = float(tta_critical_threshold)
         self.min_scale = float(min_scale)
         self.stop_duration = float(stop_duration)
         self.critical_since = None   # timestamp critical tier began, else None
@@ -257,7 +263,9 @@ class ThrottleScaler:
                     f'{confidence_reduced_threshold}% critical<'
                     f'{confidence_critical_threshold}%, novelty reduced>'
                     f'{novelty_reduced_threshold}% critical>'
-                    f'{novelty_critical_threshold}%, min_scale={min_scale}, '
+                    f'{novelty_critical_threshold}%, TTA-stability reduced<'
+                    f'{tta_reduced_threshold}% critical<'
+                    f'{tta_critical_threshold}%, min_scale={min_scale}, '
                     f'stop_after={stop_duration}s')
 
     def _signal_scale(self, value, reduced_threshold, critical_threshold,
@@ -286,7 +294,7 @@ class ThrottleScaler:
                 return self.min_scale + (1.0 - self.min_scale) * frac, False
             return self.min_scale, True
 
-    def run(self, throttle, confidence, novelty):
+    def run(self, throttle, confidence, novelty, tta_stability=None):
         if throttle is None:
             return throttle
 
@@ -296,15 +304,19 @@ class ThrottleScaler:
         nov_scale, nov_critical = self._signal_scale(
             novelty, self.novelty_reduced_threshold,
             self.novelty_critical_threshold, ascending=True)
+        # TTA stability is a "high is good" signal, same direction as confidence.
+        tta_scale, tta_critical = self._signal_scale(
+            tta_stability, self.tta_reduced_threshold,
+            self.tta_critical_threshold, ascending=False)
 
-        scales = [s for s in (conf_scale, nov_scale) if s is not None]
+        scales = [s for s in (conf_scale, nov_scale, tta_scale)
+                  if s is not None]
         if not scales:
             # No usable signal -> do not interfere with driving.
             if not self._warned_no_signal:
-                logger.warning('ThrottleScaler: neither confidence nor '
-                               'novelty is available (is '
-                               'XAI_CONFIDENCE_ENABLED/'
-                               'XAI_NOVELTY_ENABLED on, and the model '
+                logger.warning('ThrottleScaler: no signal available (is '
+                               'XAI_CONFIDENCE_ENABLED/XAI_NOVELTY_ENABLED/'
+                               'XAI_TTA_ENABLED on, and the model '
                                'calibrated?); throttle passed through '
                                'unchanged.')
                 self._warned_no_signal = True
@@ -312,7 +324,7 @@ class ThrottleScaler:
             return throttle
 
         scale = min(scales)
-        any_critical = conf_critical or nov_critical
+        any_critical = conf_critical or nov_critical or tta_critical
 
         if any_critical:
             now = time.time()

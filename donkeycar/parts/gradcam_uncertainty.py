@@ -380,6 +380,51 @@ def _collect_novelty(records, model_path, cfg, calib, progress_callback=None):
     return smoothed
 
 
+def _collect_tta(records, model_path, cfg, calib, progress_callback=None):
+    """
+    Get a per-frame smoothed TTA (test-time augmentation) steering-variance
+    list, preferring values logged in the tub, else replaying through
+    TTAStabilityDetector. Returns a list of raw variance floats the same length
+    as `records`, or None if the model's calibration has no 'tta' block.
+
+    :param progress_callback: optional ``callback(stage, current, total)``,
+                              called as frames are processed (stage='tta').
+    """
+    if calib is None or calib.get('tta') is None:
+        return None
+
+    logged = [r.underlying.get('pilot/smoothed_tta_variance') for r in records]
+    n_logged = sum(v is not None for v in logged)
+    if n_logged >= 0.5 * len(records) and n_logged > 0:
+        logger.info(f'Using logged TTA variance for {n_logged}/'
+                    f'{len(records)} frames.')
+        if progress_callback:
+            progress_callback('tta', len(records), len(records))
+        return [v if v is not None else 0.0 for v in logged]
+
+    logger.info(f'No logged TTA variance in tub; replaying {len(records)} '
+                f'frames through TTAStabilityDetector...')
+    from donkeycar.parts.keras import KerasLinear
+    from donkeycar.parts.mc_calibrate import default_calib_path
+    from donkeycar.parts.tta import TTAStabilityDetector
+    pilot = KerasLinear()
+    pilot.load(model_path)
+    part = TTAStabilityDetector(
+        pilot, calibration_path=default_calib_path(model_path),
+        num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
+        alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2),
+        strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2), seed=0)
+    smoothed = []
+    total = len(records)
+    for i, record in enumerate(records):
+        smoothed.append(part.run(record.image())[2])
+        if (i + 1) % 200 == 0:
+            logger.info(f'  {i + 1}/{total} frames')
+        if progress_callback:
+            progress_callback('tta', i + 1, total)
+    return smoothed
+
+
 def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                 top_k=50, percentile=None, analyze_all=False, limit=None,
                 export_frames=False, ig_steps=32, progress_callback=None):
@@ -442,9 +487,22 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             return None
         return novelty_distance_to_score(d, calib['novelty_global'])
 
+    # Per-frame TTA (test-time augmentation) stability timeline -- cheap-ish,
+    # every frame, independent of the Grad-CAM frame selection. None if the
+    # model's calibration has no 'tta' block.
+    tta_variances = _collect_tta(records, model_path, cfg, calib,
+                                 progress_callback=progress_callback)
+
+    def tta_stability(var):
+        if calib is None or calib.get('tta') is None or var is None:
+            return None
+        from donkeycar.parts.mc_calibrate import tta_variance_to_stability
+        return tta_variance_to_stability(var, calib['tta'])
+
     timeline = []
     for i, (record, v) in enumerate(zip(records, variances)):
         nd = novelty_distances[i] if novelty_distances is not None else None
+        tv = tta_variances[i] if tta_variances is not None else None
         timeline.append({
             'index': record.underlying.get('_index'),
             'timestamp_ms': record.underlying.get('_timestamp_ms'),
@@ -452,6 +510,8 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             'confidence': conf(v),
             'novelty_distance': nd,
             'novelty_score': nov_score(nd),
+            'tta_variance': tv,
+            'tta_stability': tta_stability(tv),
             # image filename inside the tub's images/ dir, so the viewer can
             # show the camera frame for non-analysed frames when the tub is
             # available locally.

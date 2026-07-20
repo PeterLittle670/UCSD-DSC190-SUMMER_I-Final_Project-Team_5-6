@@ -205,6 +205,8 @@
       txt += ' · confidence <b>' + Math.round(entry.confidence) + '%</b>';
     if (entry.novelty_score !== null && entry.novelty_score !== undefined)
       txt += ' · novelty <b>' + Math.round(entry.novelty_score) + '%</b>';
+    if (entry.tta_stability !== null && entry.tta_stability !== undefined)
+      txt += ' · TTA stability <b>' + Math.round(entry.tta_stability) + '%</b>';
     readout.innerHTML = txt;
     drawGraph();
   }

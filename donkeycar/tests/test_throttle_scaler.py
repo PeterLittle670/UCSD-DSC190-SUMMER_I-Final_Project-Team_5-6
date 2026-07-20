@@ -48,6 +48,37 @@ class TestThrottleScalerTiers(unittest.TestCase):
         self.assertAlmostEqual(result, 0.4, places=6)
 
 
+class TestThrottleScalerTTASignal(unittest.TestCase):
+    # TTA stability is "high is good" like confidence: reduced<65, critical<25
+
+    def setUp(self):
+        self.scaler = ThrottleScaler(min_scale=0.4, stop_duration=1.0)
+
+    def test_tta_none_does_not_block_other_signals(self):
+        # confidence full, novelty full, tta unavailable -> full throttle
+        self.assertEqual(self.scaler.run(1.0, 90.0, 5.0, None), 1.0)
+
+    def test_tta_alone_scales_when_fragile(self):
+        # only TTA available and mid-reduced tier (midpoint of 25..65 -> 0.7)
+        result = self.scaler.run(1.0, None, None, 45.0)
+        self.assertAlmostEqual(result, 0.7, places=6)
+
+    def test_tta_is_included_in_min_of_scales(self):
+        # confidence full (1.0), but TTA critical (0.4) -> 0.4 wins
+        with mock.patch('donkeycar.parts.mc_dropout.time.time', return_value=100.0):
+            result = self.scaler.run(1.0, 90.0, 5.0, 10.0)
+        self.assertAlmostEqual(result, 0.4, places=6)
+
+    def test_all_signals_none_passes_through(self):
+        self.assertEqual(self.scaler.run(0.5, None, None, None), 0.5)
+
+    def test_sustained_tta_critical_forces_stop(self):
+        with mock.patch('donkeycar.parts.mc_dropout.time.time', return_value=100.0):
+            self.scaler.run(1.0, None, None, 10.0)
+        with mock.patch('donkeycar.parts.mc_dropout.time.time', return_value=101.5):
+            self.assertEqual(self.scaler.run(1.0, None, None, 10.0), 0.0)
+
+
 class TestThrottleScalerSustainedStop(unittest.TestCase):
 
     def setUp(self):
