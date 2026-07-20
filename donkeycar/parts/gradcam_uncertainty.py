@@ -14,7 +14,7 @@ fine for post-drive analysis but too heavy for the 20Hz drive loop.
 Frame selection (feasibility): by default only the top-K most uncertain
 frames are analysed, ranked by the steering variance either logged in the
 tub (``pilot/smoothed_variance``, written when driving with
-USE_MC_DROPOUT_CONFIDENCE enabled)
+XAI_CONFIDENCE_ENABLED enabled)
 or recomputed by replaying the tub through the MC-Dropout part. ``--all``
 forces every frame (use only for short drives).
 
@@ -26,10 +26,13 @@ spatial "novelty map" overlay is rendered for the analysed frames, showing
 *where* in the image the features look unlike anything in training data --
 a different question from the attention/uncertainty overlays above.
 
-Each analysed frame also gets a fourth overlay: vanilla-gradient pixel
-saliency (see ``donkeycar.parts.salient``) -- gradients taken directly
-against full-resolution input pixels rather than the coarse conv2d_5 grid.
-A different, noisier, complementary lens to the three maps above.
+Each analysed frame also gets two pixel-level overlays (see
+``donkeycar.parts.salient``): vanilla-gradient saliency (a single raw input
+gradient -- noisy) and Integrated Gradients (path-integrated, axiomatic,
+cleaner). Both take gradients against full-resolution input pixels rather than
+the coarse conv2d_5 grid -- complementary lenses to the Grad-CAM maps above.
+A Grad-CAM++ attention map (sharper, multi-region variant of the mean
+attention) is rendered too.
 
 Output (consumed by the Feature 4 viewer):
     <out>/
@@ -38,15 +41,17 @@ Output (consumed by the Feature 4 viewer):
       images/<idx>_orig.jpg      -- camera frame
       images/<idx>_unc.png       -- uncertainty-map overlay (attention variance)
       images/<idx>_attn.png      -- mean-attention overlay (where it looked)
+      images/<idx>_attnpp.png    -- Grad-CAM++ attention overlay (sharper)
       images/<idx>_novelty.png   -- novelty overlay (where features are
                                    unlike training data); only if the model's
                                    calibration has novelty stats
       images/<idx>_saliency.png  -- vanilla-gradient pixel saliency overlay
+      images/<idx>_ig.png        -- Integrated Gradients pixel attribution
 
 Usage:
     python -m donkeycar.parts.gradcam_uncertainty \
         --tub data/ --model models/mypilot.h5 [--top-k 50] [--all] \
-        [--percentile 90] [--limit N] [--passes 15] [--out dir]
+        [--percentile 90] [--limit N] [--passes 15] [--ig-steps 32] [--out dir]
 
 Caveats: linear model only (same scope as the live signal); the variance map
 inherits MC-Dropout's blind spots -- it measures disagreement between dropout
@@ -131,6 +136,83 @@ class GradCamUncertainty:
         maxes = cams.reshape(self.num_passes, -1).max(axis=1)
         maxes[maxes == 0] = 1.0
         return cams / maxes[:, None, None]
+
+    def attention_maps_pp(self, norm_img):
+        """
+        Grad-CAM++ variant of :meth:`attention_maps`. Same batched N-pass
+        structure and same ``grad_model``; only the per-location weighting
+        changes.
+
+        Plain Grad-CAM pools the gradient with a flat spatial *average*, so
+        every location in a channel counts equally -- which can wash out the
+        map when several separate regions each matter (e.g. both lane lines).
+        Grad-CAM++ replaces that average with a *weighted* one: each location's
+        gradient is scaled by an ``alpha`` coefficient built from higher-order
+        gradient terms, so locations that individually push the prediction
+        hardest count for more. The result is sharper and more complete when
+        attention is genuinely multi-region.
+
+        Derivation note (regression output): the textbook Grad-CAM++ alphas
+        assume a classification score of the form ``exp(logit)``, whose 2nd/3rd
+        derivatives supply the higher-order terms. Our steering head is a raw
+        linear regression, so those analytic derivatives are zero and a literal
+        port would degenerate back to plain Grad-CAM. We therefore use the
+        common practical approximation (as in the reference Grad-CAM++
+        implementations): estimate the higher-order terms from powers of the
+        *first-order* gradient and the activations directly --
+        ``alpha = g^2 / (2 g^2 + (sum_ab A_ab) g^3)`` -- which stays
+        non-degenerate because the steering gradient w.r.t. conv2d_5 varies
+        across space (the flatten+dense head is position-dependent).
+
+        :param norm_img: float32 image, [0,1], shape (H, W, C)
+        :return: np array (N, h, w) of per-pass Grad-CAM++ maps, each
+                 max-normalised to [0, 1] (like :meth:`attention_maps`).
+        """
+        batch = tf.convert_to_tensor(
+            np.repeat(norm_img[np.newaxis, ...], self.num_passes, axis=0))
+
+        with tf.GradientTape() as tape:
+            features, steering = self.grad_model(batch, training=True)
+            target = tf.reduce_sum(steering)
+        grads = tape.gradient(target, features)          # (N, h, w, c)
+
+        grads2 = grads ** 2
+        grads3 = grads ** 3
+        # sum of activations per channel (the (sum_ab A_ab) term), broadcast
+        # back over the spatial grid.
+        global_sum = tf.reduce_sum(features, axis=(1, 2), keepdims=True)
+        denom = 2.0 * grads2 + global_sum * grads3
+        denom = tf.where(tf.abs(denom) > 1e-10, denom, tf.ones_like(denom))
+        alphas = grads2 / denom
+        # Per-channel weights: alpha-weighted sum of the positive gradients.
+        weights = tf.reduce_sum(alphas * tf.nn.relu(grads),
+                                axis=(1, 2), keepdims=True)
+        cams = tf.nn.relu(tf.reduce_sum(weights * features, axis=-1))
+        cams = cams.numpy()                              # (N, h, w)
+
+        maxes = cams.reshape(self.num_passes, -1).max(axis=1)
+        maxes[maxes == 0] = 1.0
+        return cams / maxes[:, None, None]
+
+    def attention_pp_map(self, img_arr):
+        """
+        Mean Grad-CAM++ attention map for a frame, upsampled to image size and
+        normalised to [0,1] -- the ++ analogue of the mean-attention map that
+        :meth:`uncertainty_map` returns as ``mean_map``.
+
+        :param img_arr: uint8 [0,255] camera frame (H, W, C)
+        :return: (H, W) float map in [0,1].
+        """
+        from donkeycar.utils import normalize_image
+        norm = normalize_image(img_arr).astype(np.float32)
+        cams = self.attention_maps_pp(norm)
+        mean_map = cams.mean(axis=0)
+
+        h, w = img_arr.shape[:2]
+        up = _resize_map(mean_map, w, h)
+        if up.max() > 0:
+            up = up / up.max()
+        return up
 
     def uncertainty_map(self, img_arr):
         """
@@ -220,7 +302,7 @@ def _collect_variances(records, model_path, cfg, num_passes, alpha,
                        progress_callback=None):
     """
     Get a per-frame (raw, smoothed) steering-variance list, preferring values
-    logged in the tub (drives recorded with USE_MC_DROPOUT_CONFIDENCE
+    logged in the tub (drives recorded with XAI_CONFIDENCE_ENABLED
     enabled), else replaying the frames through the MC-Dropout part.
 
     :param progress_callback: optional ``callback(stage, current, total)``,
@@ -300,10 +382,12 @@ def _collect_novelty(records, model_path, cfg, calib, progress_callback=None):
 
 def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                 top_k=50, percentile=None, analyze_all=False, limit=None,
-                export_frames=False, progress_callback=None):
+                export_frames=False, ig_steps=32, progress_callback=None):
     """
     Run the full Feature 3 pipeline on one tub. Returns the data.json dict.
 
+    :param ig_steps:          number of Riemann-sum steps for the Integrated
+                              Gradients overlay (offline pixel attribution).
     :param progress_callback: optional ``callback(stage, current, total)``,
                               called throughout the three stages in order
                               ('variance', 'novelty', 'gradcam'). Used by the
@@ -315,7 +399,8 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                                               load_calibration,
                                               variance_to_confidence,
                                               novelty_distance_to_score)
-    from donkeycar.parts.salient import VanillaGradientSaliency
+    from donkeycar.parts.salient import (VanillaGradientSaliency,
+                                         IntegratedGradients)
     from donkeycar.pipeline.types import TubDataset
 
     t0 = time.time()
@@ -406,6 +491,7 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
     pilot.load(model_path)
     engine = GradCamUncertainty(pilot.interpreter.model, num_passes=num_passes)
     saliency_engine = VanillaGradientSaliency(pilot.interpreter.model)
+    ig_engine = IntegratedGradients(pilot.interpreter.model, steps=ig_steps)
 
     # Spatial novelty stats, if this model's calibration has them -- computing
     # the per-frame spatial map only needs these arrays, no extra model.
@@ -444,6 +530,13 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             'attention_variance_peak': raw_peak,
         }
 
+        # Grad-CAM++ attention (sharper, multi-region variant of 'attention').
+        attnpp_map = engine.attention_pp_map(img)
+        attnpp_name = f'{idx:06d}_attnpp.png'
+        Image.fromarray(overlay_heatmap(img, attnpp_map)).save(
+            os.path.join(images_dir, attnpp_name))
+        frame_entry['attention_pp'] = f'images/{attnpp_name}'
+
         if novelty_spatial is not None:
             nov_map, nov_peak = engine.novelty_map(
                 img, ns_mean, ns_var, ns_active, ns_eps)
@@ -453,12 +546,19 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             frame_entry['novelty'] = f'images/{nov_name}'
             frame_entry['novelty_map_peak'] = nov_peak
 
-        sal_map = saliency_engine.saliency_map(
-            normalize_image(img).astype(np.float32))
+        norm_img = normalize_image(img).astype(np.float32)
+        sal_map = saliency_engine.saliency_map(norm_img)
         sal_name = f'{idx:06d}_saliency.png'
         Image.fromarray(overlay_heatmap(img, sal_map)).save(
             os.path.join(images_dir, sal_name))
         frame_entry['saliency'] = f'images/{sal_name}'
+
+        # Integrated Gradients: cleaner, axiomatic pixel attribution.
+        ig_map = ig_engine.saliency_map(norm_img)
+        ig_name = f'{idx:06d}_ig.png'
+        Image.fromarray(overlay_heatmap(img, ig_map)).save(
+            os.path.join(images_dir, ig_name))
+        frame_entry['integrated_gradients'] = f'images/{ig_name}'
 
         frames[str(idx)] = frame_entry
         if (n + 1) % 10 == 0:
@@ -506,6 +606,9 @@ def main(args=None):
     parser.add_argument('--percentile', type=float, default=None,
                         help='instead analyse frames >= this variance '
                              'percentile (e.g. 90)')
+    parser.add_argument('--ig-steps', type=int, default=None,
+                        help='Integrated Gradients Riemann steps '
+                             '(default cfg XAI_IG_STEPS or 32)')
     parser.add_argument('--all', action='store_true',
                         help='analyse every frame (short drives only)')
     parser.add_argument('--limit', type=int, default=None,
@@ -523,8 +626,9 @@ def main(args=None):
         logger.warning(f'No ./config.py; using bundled defaults.')
     cfg = dk.load_config(config_path)
 
-    num_passes = parsed.passes or getattr(cfg, 'MC_DROPOUT_PASSES', 15)
-    alpha = getattr(cfg, 'MC_DROPOUT_ALPHA', 0.2)
+    num_passes = parsed.passes or getattr(cfg, 'XAI_CONFIDENCE_PASSES', 15)
+    alpha = getattr(cfg, 'XAI_CONFIDENCE_ALPHA', 0.2)
+    ig_steps = parsed.ig_steps or getattr(cfg, 'XAI_IG_STEPS', 32)
     out_dir = parsed.out or os.path.join(os.path.expanduser(parsed.tub),
                                          'gradcam_analysis')
 
@@ -532,7 +636,7 @@ def main(args=None):
                        num_passes=num_passes, alpha=alpha,
                        top_k=parsed.top_k, percentile=parsed.percentile,
                        analyze_all=parsed.all, limit=parsed.limit,
-                       export_frames=parsed.export_frames)
+                       export_frames=parsed.export_frames, ig_steps=ig_steps)
     print(f"\nGrad-CAM uncertainty analysis complete:")
     print(f"  frames in drive : {data['n_records']}")
     print(f"  frames analysed : {data['n_analyzed']}")

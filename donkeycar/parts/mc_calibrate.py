@@ -232,9 +232,9 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     import tensorflow as tf
 
     num_passes = num_passes if num_passes is not None \
-        else getattr(cfg, 'MC_DROPOUT_PASSES', 15)
+        else getattr(cfg, 'XAI_CONFIDENCE_PASSES', 15)
     alpha = alpha if alpha is not None \
-        else getattr(cfg, 'MC_DROPOUT_ALPHA', 0.2)
+        else getattr(cfg, 'XAI_CONFIDENCE_ALPHA', 0.2)
 
     logger.info(f'Loading model {model_path}')
     pilot = KerasLinear()
@@ -332,9 +332,9 @@ def main(args=None):
     parser.add_argument('--limit', type=int, default=None,
                         help='only use the first N frames')
     parser.add_argument('--passes', type=int, default=None,
-                        help='override MC_DROPOUT_PASSES')
+                        help='override XAI_CONFIDENCE_PASSES')
     parser.add_argument('--alpha', type=float, default=None,
-                        help='override MC_DROPOUT_ALPHA')
+                        help='override XAI_CONFIDENCE_ALPHA')
     parser.add_argument('--out', default=None,
                         help='output calibration path '
                              '(default <model>.calib.json)')

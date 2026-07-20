@@ -52,10 +52,10 @@ class MCDropoutConfidence:
     :param pilot:       a loaded KerasPilot (KerasLinear). Its underlying Keras
                         model is reused directly -- we do not reload weights.
     :param num_passes:  number of stochastic forward passes (N). Wired to
-                        ``cfg.MC_DROPOUT_PASSES``.
+                        ``cfg.XAI_CONFIDENCE_PASSES``.
     :param alpha:       EMA smoothing factor in [0, 1]. Higher = more
                         responsive, lower = smoother. Wired to
-                        ``cfg.MC_DROPOUT_ALPHA``.
+                        ``cfg.XAI_CONFIDENCE_ALPHA``.
     :param calibration_path: path to a ``<model>.calib.json`` produced by
                         ``donkeycar.parts.mc_calibrate``. Optional.
     """
@@ -303,8 +303,8 @@ class ThrottleScaler:
             if not self._warned_no_signal:
                 logger.warning('ThrottleScaler: neither confidence nor '
                                'novelty is available (is '
-                               'USE_MC_DROPOUT_CONFIDENCE/'
-                               'USE_NOVELTY_DETECTION on, and the model '
+                               'XAI_CONFIDENCE_ENABLED/'
+                               'XAI_NOVELTY_ENABLED on, and the model '
                                'calibrated?); throttle passed through '
                                'unchanged.')
                 self._warned_no_signal = True

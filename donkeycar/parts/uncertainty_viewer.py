@@ -125,8 +125,9 @@ class LauncherState:
             from donkeycar.parts.gradcam_uncertainty import analyze_tub
             analyze_tub(
                 self.cfg, tub, model, out_dir,
-                num_passes=getattr(self.cfg, 'MC_DROPOUT_PASSES', 15),
-                alpha=getattr(self.cfg, 'MC_DROPOUT_ALPHA', 0.2),
+                num_passes=getattr(self.cfg, 'XAI_CONFIDENCE_PASSES', 15),
+                alpha=getattr(self.cfg, 'XAI_CONFIDENCE_ALPHA', 0.2),
+                ig_steps=getattr(self.cfg, 'XAI_IG_STEPS', 32),
                 top_k=int(form['value']) if mode == 'top_k'
                       and form.get('value') else 50,
                 percentile=float(form['value']) if mode == 'percentile'

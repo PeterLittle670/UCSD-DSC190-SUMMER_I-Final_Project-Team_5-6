@@ -234,7 +234,7 @@ var driveHandler = new function() {
       $('#throttle_label').html(throttleRounded);
       $('#steering_label').html(steeringRounded);
 
-      // MC-Dropout model confidence meter (only present when USE_MC_DROPOUT_CONFIDENCE is on)
+      // MC-Dropout model confidence meter (only present when XAI_CONFIDENCE_ENABLED is on)
       if (state.confidence !== null && state.confidence !== undefined) {
         var conf = Math.max(0, Math.min(100, Math.round(state.confidence)));
         // Tiers mirror the calibration anchors: normal / reduced / critical.
@@ -250,7 +250,7 @@ var driveHandler = new function() {
       }
 
       // Feature-space novelty (OOD) meter (only present when
-      // USE_NOVELTY_DETECTION is on). Tier colors are INVERTED from
+      // XAI_NOVELTY_ENABLED is on). Tier colors are INVERTED from
       // confidence: low novelty (familiar) = green, high (unfamiliar) = red.
       if (state.novelty !== null && state.novelty !== undefined) {
         var nov = Math.max(0, Math.min(100, Math.round(state.novelty)));

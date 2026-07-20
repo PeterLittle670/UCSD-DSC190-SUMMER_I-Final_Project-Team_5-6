@@ -500,8 +500,8 @@ CACHE_POLICY = 'ARRAY'
 # both, or neither can be enabled -- they don't depend on each other, and
 # neither needs any command-line flag. Both need a calibration file
 # (<model>.calib.json, produced by `python -m donkeycar.parts.mc_calibrate`
-# or automatically via MC_DROPOUT_AUTO_CALIBRATE below) to show a % on the
-# dashboard; without one the raw numbers still get logged to the tub.
+# or automatically via XAI_CONFIDENCE_AUTO_CALIBRATE below) to show a % on
+# the dashboard; without one the raw numbers still get logged to the tub.
 # ============================================================
 
 # --- Signal 1: MC-Dropout confidence -------------------------------------
@@ -510,21 +510,21 @@ CACHE_POLICY = 'ARRAY'
 # ("do my dropout sub-networks agree?"). NOT a calibrated probability.
 # Costs N extra forward passes per frame -- the more expensive of the two
 # signals, hence its own explicit toggle.
-USE_MC_DROPOUT_CONFIDENCE = False
-MC_DROPOUT_PASSES = 15      # number of stochastic forward passes per frame
-MC_DROPOUT_ALPHA = 0.2      # EMA smoothing of the variance (0..1, higher=faster)
+XAI_CONFIDENCE_ENABLED = False   # master on/off for the confidence signal
+XAI_CONFIDENCE_PASSES = 15       # number of stochastic forward passes per frame
+XAI_CONFIDENCE_ALPHA = 0.2       # EMA smoothing of the variance (0..1, higher=faster)
 # Minimum seconds between confidence updates. 0 = every frame (default).
 # E.g. 0.15 updates confidence ~6-7x/sec; between updates the car still
 # steers every frame via a cheap single-pass inference, only the confidence
 # numbers are held. Reduces average compute load on slow hardware (Pi), at
 # the cost of a periodic slower loop iteration when the N-pass update runs.
-MC_DROPOUT_INTERVAL = 0.0
+XAI_CONFIDENCE_INTERVAL = 0.0
 # When True, training automatically builds the confidence (and novelty)
 # calibration on the training tubs and saves <model>.calib.json next to the
 # model, so the model ships ready for the dashboard. Adds a replay pass
 # (~minutes), so it is off by default. Linear model only.
-MC_DROPOUT_AUTO_CALIBRATE = False
-MC_DROPOUT_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
+XAI_CONFIDENCE_AUTO_CALIBRATE = False
+XAI_CONFIDENCE_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
 
 # --- Signal 2: feature-space novelty (out-of-distribution) detection -----
 # A single cheap deterministic forward pass per frame measuring how far the
@@ -533,8 +533,8 @@ MC_DROPOUT_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
 # question from confidence above: a frame can be low-confidence yet
 # familiar-looking, or high-confidence yet genuinely novel (confidently
 # wrong). See donkeycar.parts.novelty module docstring for the full picture.
-USE_NOVELTY_DETECTION = False
-NOVELTY_EMA_ALPHA = 0.2     # EMA smoothing of the raw Mahalanobis distance
+XAI_NOVELTY_ENABLED = False   # master on/off for the novelty signal
+XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
 
 # --- Throttle scaling (Feature 2) -----------------------------------------
 # Scales autopilot throttle down as confidence drops and/or novelty rises;
@@ -542,13 +542,21 @@ NOVELTY_EMA_ALPHA = 0.2     # EMA smoothing of the raw Mahalanobis distance
 # more conservative (lowest) scale across whichever of the two signals above
 # are currently enabled and calibrated -- enabling only one of them still
 # works, using that one signal alone. Disabled -> zero behaviour change.
-USE_THROTTLE_SCALING = False
-CONFIDENCE_REDUCED_THRESHOLD = 65.0    # below this confidence %, start scaling
-CONFIDENCE_CRITICAL_THRESHOLD = 25.0   # below this confidence %, critical tier
-NOVELTY_REDUCED_THRESHOLD = 25.0       # above this novelty %, start scaling
-NOVELTY_CRITICAL_THRESHOLD = 65.0      # above this novelty %, critical tier
-CONFIDENCE_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from either signal alone
-CONFIDENCE_STOP_DURATION = 1.0         # secs sustained-critical (either signal) before full stop
+XAI_THROTTLE_SCALING_ENABLED = False
+XAI_CONFIDENCE_REDUCED_THRESHOLD = 65.0    # below this confidence %, start scaling
+XAI_CONFIDENCE_CRITICAL_THRESHOLD = 25.0   # below this confidence %, critical tier
+XAI_NOVELTY_REDUCED_THRESHOLD = 25.0       # above this novelty %, start scaling
+XAI_NOVELTY_CRITICAL_THRESHOLD = 65.0      # above this novelty %, critical tier
+XAI_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from either signal alone
+XAI_THROTTLE_STOP_DURATION = 1.0   # secs sustained-critical (either signal) before full stop
+
+# --- Offline analysis (Grad-CAM tool) -------------------------------------
+# These only affect the offline post-drive analysis tool
+# (donkeycar.parts.gradcam_uncertainty / the run_gradcam_analysis.py GUI),
+# never the live drive loop. Each analysed frame gets several overlay layers:
+# Grad-CAM attention + uncertainty, Grad-CAM++ attention (sharper), novelty,
+# vanilla saliency, and Integrated Gradients.
+XAI_IG_STEPS = 32   # Integrated Gradients Riemann steps (20-50 typical; higher=cleaner+slower)
 
 # MODEL OPTIMIZATION
 # Automatically create TFLite model for faster inference on Pi.

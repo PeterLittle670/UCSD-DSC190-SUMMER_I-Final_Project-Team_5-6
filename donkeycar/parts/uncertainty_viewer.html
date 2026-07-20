@@ -77,9 +77,11 @@
       <label>layer
         <select id="layer">
           <option value="overlay" selected>uncertainty overlay</option>
-          <option value="attention">mean attention</option>
+          <option value="attention">mean attention (Grad-CAM)</option>
+          <option value="attention_pp">attention++ (Grad-CAM++)</option>
           <option value="novelty">novelty (OOD)</option>
           <option value="saliency">saliency (pixel gradient)</option>
+          <option value="integrated_gradients">integrated gradients</option>
           <option value="orig">camera only</option>
         </select>
       </label>
@@ -156,6 +158,10 @@
       const layer = layerSel.value;
       if (layer === 'attention') return f.attention;
       if (layer === 'orig') return f.orig;
+      // attention++ / IG maps may be absent on analyses produced before those
+      // layers existed -- fall through to unavailable rather than the overlay.
+      if (layer === 'attention_pp') return f.attention_pp || null;
+      if (layer === 'integrated_gradients') return f.integrated_gradients || null;
       // novelty map may be absent even on an analysed frame if the model's
       // calibration predates novelty stats -- fall through to unavailable.
       if (layer === 'novelty') return f.novelty || null;
@@ -181,6 +187,10 @@
       if (layerSel.value === 'orig') showBadge('analysed · overlays hidden');
       else if (layerSel.value === 'novelty' && !f.novelty)
         showBadge('no novelty map for this frame (model has no novelty calibration)');
+      else if (layerSel.value === 'attention_pp' && !f.attention_pp)
+        showBadge('no attention++ map (analysis predates Grad-CAM++)');
+      else if (layerSel.value === 'integrated_gradients' && !f.integrated_gradients)
+        showBadge('no integrated-gradients map (analysis predates this layer)');
       else badge.hidden = true;
     } else {
       showBadge('no uncertainty map for this frame');

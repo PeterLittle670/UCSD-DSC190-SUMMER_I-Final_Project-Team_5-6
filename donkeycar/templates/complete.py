@@ -420,13 +420,13 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         # novelty detection below -- each is its own config flag, and each
         # works with or without the other.
         #
-        use_mc_dropout = getattr(cfg, 'USE_MC_DROPOUT_CONFIDENCE', False)
+        use_mc_dropout = getattr(cfg, 'XAI_CONFIDENCE_ENABLED', False)
         if use_mc_dropout:
             from donkeycar.parts.mc_dropout import MCDropoutConfidence
             from donkeycar.parts.mc_calibrate import default_calib_path
-            n_passes = getattr(cfg, 'MC_DROPOUT_PASSES', 15)
-            alpha = getattr(cfg, 'MC_DROPOUT_ALPHA', 0.2)
-            mc_interval = getattr(cfg, 'MC_DROPOUT_INTERVAL', 0.0)
+            n_passes = getattr(cfg, 'XAI_CONFIDENCE_PASSES', 15)
+            alpha = getattr(cfg, 'XAI_CONFIDENCE_ALPHA', 0.2)
+            mc_interval = getattr(cfg, 'XAI_CONFIDENCE_INTERVAL', 0.0)
             # Look for a calibration file next to the model so the dashboard
             # can show a confidence %. Absent -> variance still logged, but
             # confidence displays as "not calibrated".
@@ -452,13 +452,13 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
 
         #
         # Feature-space novelty (out-of-distribution) detection. Independent
-        # of USE_MC_DROPOUT_CONFIDENCE: it's a single cheap deterministic
+        # of XAI_CONFIDENCE_ENABLED: it's a single cheap deterministic
         # pass, so it shouldn't force the N-pass MC-Dropout cost onto someone
         # who only wants OOD detection. Rides alongside whichever part drives
         # above (mc_pilot or kl) as a pure auxiliary observer -- it never
         # produces steering/throttle.
         #
-        use_novelty = getattr(cfg, 'USE_NOVELTY_DETECTION', False)
+        use_novelty = getattr(cfg, 'XAI_NOVELTY_ENABLED', False)
         if use_novelty:
             from donkeycar.parts.novelty import FeatureNoveltyDetector
             from donkeycar.parts.mc_calibrate import default_calib_path
@@ -471,7 +471,7 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
             logger.info("Enabling feature-space novelty detection")
             novelty_part = FeatureNoveltyDetector(
                 kl, calibration_path=novelty_calib_path,
-                alpha=getattr(cfg, 'NOVELTY_EMA_ALPHA', 0.2))
+                alpha=getattr(cfg, 'XAI_NOVELTY_ALPHA', 0.2))
             V.add(novelty_part, inputs=[inputs[0]],
                   outputs=['pilot/novelty', 'pilot/raw_novelty_distance',
                            'pilot/smoothed_novelty_distance'],
@@ -484,22 +484,22 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         # currently enabled and calibrated; a disabled or uncalibrated
         # signal is ignored rather than blocking the other one.
         #
-        if getattr(cfg, 'USE_THROTTLE_SCALING', False):
+        if getattr(cfg, 'XAI_THROTTLE_SCALING_ENABLED', False):
             if not use_mc_dropout and not use_novelty:
-                logger.warning("USE_THROTTLE_SCALING is set but neither "
-                               "USE_MC_DROPOUT_CONFIDENCE nor "
-                               "USE_NOVELTY_DETECTION is enabled; throttle "
+                logger.warning("XAI_THROTTLE_SCALING_ENABLED is set but neither "
+                               "XAI_CONFIDENCE_ENABLED nor "
+                               "XAI_NOVELTY_ENABLED is enabled; throttle "
                                "scaling has no signal to act on and will be "
                                "inactive.")
             from donkeycar.parts.mc_dropout import ThrottleScaler
             logger.info("Enabling confidence/novelty-based throttle scaling")
             throttle_scaler = ThrottleScaler(
-                confidence_reduced_threshold=getattr(cfg, 'CONFIDENCE_REDUCED_THRESHOLD', 65.0),
-                confidence_critical_threshold=getattr(cfg, 'CONFIDENCE_CRITICAL_THRESHOLD', 25.0),
-                novelty_reduced_threshold=getattr(cfg, 'NOVELTY_REDUCED_THRESHOLD', 25.0),
-                novelty_critical_threshold=getattr(cfg, 'NOVELTY_CRITICAL_THRESHOLD', 65.0),
-                min_scale=getattr(cfg, 'CONFIDENCE_THROTTLE_MIN_SCALE', 0.4),
-                stop_duration=getattr(cfg, 'CONFIDENCE_STOP_DURATION', 1.0))
+                confidence_reduced_threshold=getattr(cfg, 'XAI_CONFIDENCE_REDUCED_THRESHOLD', 65.0),
+                confidence_critical_threshold=getattr(cfg, 'XAI_CONFIDENCE_CRITICAL_THRESHOLD', 25.0),
+                novelty_reduced_threshold=getattr(cfg, 'XAI_NOVELTY_REDUCED_THRESHOLD', 25.0),
+                novelty_critical_threshold=getattr(cfg, 'XAI_NOVELTY_CRITICAL_THRESHOLD', 65.0),
+                min_scale=getattr(cfg, 'XAI_THROTTLE_MIN_SCALE', 0.4),
+                stop_duration=getattr(cfg, 'XAI_THROTTLE_STOP_DURATION', 1.0))
             V.add(throttle_scaler,
                   inputs=['pilot/throttle', 'pilot/confidence', 'pilot/novelty'],
                   outputs=['pilot/throttle'],
@@ -617,14 +617,14 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
     # Log the MC-Dropout confidence signal with each frame; this is the
     # input for the offline Grad-CAM analysis tool. Values are None (and thus
     # skipped by the tub) whenever the pilot isn't running.
-    if getattr(cfg, 'USE_MC_DROPOUT_CONFIDENCE', False):
+    if getattr(cfg, 'XAI_CONFIDENCE_ENABLED', False):
         inputs += ['pilot/confidence', 'pilot/raw_variance',
                    'pilot/smoothed_variance']
         types += ['float', 'float', 'float']
 
     # Log the novelty (out-of-distribution) signal too, independent of
-    # USE_MC_DROPOUT_CONFIDENCE -- input for the offline Grad-CAM analysis tool.
-    if getattr(cfg, 'USE_NOVELTY_DETECTION', False):
+    # XAI_CONFIDENCE_ENABLED -- input for the offline Grad-CAM analysis tool.
+    if getattr(cfg, 'XAI_NOVELTY_ENABLED', False):
         inputs += ['pilot/novelty', 'pilot/raw_novelty_distance',
                    'pilot/smoothed_novelty_distance']
         types += ['float', 'float', 'float']
