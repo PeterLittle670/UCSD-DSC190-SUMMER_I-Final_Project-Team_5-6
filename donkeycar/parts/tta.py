@@ -30,13 +30,20 @@ applying the inverse transform to the output -- out of scope here.)
 Like ``FeatureNoveltyDetector``, this is a pure auxiliary observer: it does
 NOT produce steering/throttle and rides alongside whichever part drives the
 car. M forward passes are batched into ONE deterministic call (same trick as
-MC-Dropout), so it is cheap enough to run live.
+MC-Dropout), so it is cheap enough to run live -- but M passes every single
+frame, unconditionally, is still real load on top of whatever else is
+running (the driving pass, MC-Dropout's own N passes, novelty's single pass).
+``XAI_TTA_INTERVAL`` rate-limits how often that M-pass update actually runs;
+between updates the last score is held with ZERO forward passes (no fallback
+pass needed, since this part never drives) -- the single biggest lever if
+running multiple signals together is straining the hardware's power budget.
 
 Model scope: like the rest of this toolkit, the default linear architecture
 (``KerasLinear``) with a single image input and a callable Keras interpreter
 -- not TFLite/TensorRT.
 """
 import logging
+import time
 
 import numpy as np
 import tensorflow as tf
@@ -92,6 +99,11 @@ class TTAStabilityDetector:
     = robust) via the model's ``calib['tta']`` block.
 
     Pure auxiliary observer (like ``FeatureNoveltyDetector``): does NOT drive.
+    Each update costs M forward passes (batched into one call) -- more
+    expensive per-update than novelty's single pass, so rate-limiting via
+    ``interval`` matters more here on slow/power-constrained hardware. Between
+    updates the last score is held and NO forward pass runs at all (no
+    fallback pass needed, since this part never drives).
 
     Run signature::
 
@@ -107,16 +119,25 @@ class TTAStabilityDetector:
     :param alpha:            EMA smoothing factor in [0, 1] for the variance.
     :param strength:         photometric augmentation strength (see
                              ``photometric_batch``).
+    :param interval:         minimum seconds between updates (each an M-pass
+                             batch). 0 (the default) updates every frame.
     :param seed:             optional RNG seed for reproducible augmentations.
     """
 
     def __init__(self, pilot, calibration_path=None, num_samples=8,
-                 alpha=0.2, strength=0.2, seed=None):
+                 alpha=0.2, strength=0.2, interval=0.0, seed=None):
         self.num_samples = int(num_samples)
         self.alpha = float(alpha)
         self.strength = float(strength)
         self.rng = np.random.default_rng(seed)
         self.smoothed_variance = None
+        self.raw_variance = 0.0
+
+        # Minimum seconds between M-pass updates. 0 = every frame. Held
+        # frames cost nothing (no forward pass at all) -- this part never
+        # drives, unlike MCDropoutConfidence's interval fallback.
+        self.interval = float(interval)
+        self.last_update_time = None
 
         interpreter = getattr(pilot, 'interpreter', None)
         self.model = getattr(interpreter, 'model', None)
@@ -156,6 +177,15 @@ class TTAStabilityDetector:
         if img_arr is None:
             return self._score(), 0.0, (self.smoothed_variance or 0.0)
 
+        now = time.time()
+        if (self.interval > 0 and self.last_update_time is not None
+                and (now - self.last_update_time) < self.interval):
+            # Rate-limited: skip the M-pass batch entirely and hold the last
+            # values -- no fallback pass needed since this part never drives.
+            return self._score(), self.raw_variance, \
+                (self.smoothed_variance or 0.0)
+        self.last_update_time = now
+
         norm = normalize_image(img_arr).astype(np.float32)
         batch = photometric_batch(norm, self.num_samples, self.strength,
                                   self.rng)
@@ -164,6 +194,7 @@ class TTAStabilityDetector:
         # Linear model returns [angle (M,1), throttle (M,1)].
         angle_samples = np.asarray(outputs[0]).reshape(-1)
         raw_variance = float(np.var(angle_samples))
+        self.raw_variance = raw_variance
 
         if self.smoothed_variance is None:
             self.smoothed_variance = raw_variance

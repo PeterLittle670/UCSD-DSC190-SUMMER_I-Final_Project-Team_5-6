@@ -471,7 +471,8 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
             logger.info("Enabling feature-space novelty detection")
             novelty_part = FeatureNoveltyDetector(
                 kl, calibration_path=novelty_calib_path,
-                alpha=getattr(cfg, 'XAI_NOVELTY_ALPHA', 0.2))
+                alpha=getattr(cfg, 'XAI_NOVELTY_ALPHA', 0.2),
+                interval=getattr(cfg, 'XAI_NOVELTY_INTERVAL', 0.0))
             V.add(novelty_part, inputs=[inputs[0]],
                   outputs=['pilot/novelty', 'pilot/raw_novelty_distance',
                            'pilot/smoothed_novelty_distance'],
@@ -500,7 +501,8 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                 kl, calibration_path=tta_calib_path,
                 num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
                 alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2),
-                strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2))
+                strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2),
+                interval=getattr(cfg, 'XAI_TTA_INTERVAL', 0.0))
             V.add(tta_part, inputs=[inputs[0]],
                   outputs=['pilot/tta_stability', 'pilot/raw_tta_variance',
                            'pilot/smoothed_tta_variance'],

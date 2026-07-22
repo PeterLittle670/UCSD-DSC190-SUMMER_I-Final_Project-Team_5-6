@@ -1,8 +1,11 @@
 import unittest
+from unittest import mock
 
 import numpy as np
+import tensorflow as tf
 
-from donkeycar.parts.novelty import mahalanobis_diag, fit_diagonal_gaussian
+from donkeycar.parts.novelty import (mahalanobis_diag, fit_diagonal_gaussian,
+                                     FeatureNoveltyDetector)
 
 
 class TestMahalanobisDiag(unittest.TestCase):
@@ -57,6 +60,78 @@ class TestFitDiagonalGaussian(unittest.TestCase):
         active = stats['active_dims']
         self.assertFalse(active[2])
         self.assertTrue(all(active[i] for i in (0, 1, 3)))
+
+
+def _tiny_pilot():
+    """A minimal model with a layer named 'dense_2', the surface
+    FeatureNoveltyDetector reaches for, wrapped in a stub pilot exposing
+    .interpreter.model."""
+    tf.random.set_seed(0)
+    inp = tf.keras.Input((8, 8, 3))
+    x = tf.keras.layers.Flatten()(inp)
+    feat = tf.keras.layers.Dense(5, name='dense_2')(x)
+    out = tf.keras.layers.Dense(1, name='n_outputs0')(feat)
+    model = tf.keras.Model(inp, out)
+
+    class _Interp:
+        def __init__(self, m):
+            self.model = m
+
+    class _Pilot:
+        def __init__(self, m):
+            self.interpreter = _Interp(m)
+
+    return _Pilot(model)
+
+
+class TestFeatureNoveltyDetectorInterval(unittest.TestCase):
+    # Rate-limiting matters here: this part rides alongside the driving pilot
+    # on every frame, so an unthrottled forward pass adds real load (and, on
+    # a Pi, real power draw) with no way to turn it down.
+
+    def setUp(self):
+        self.pilot = _tiny_pilot()
+        self.img = (np.random.default_rng(0).random((8, 8, 3)) * 255).astype(np.uint8)
+
+    def _counting_part(self, interval):
+        part = FeatureNoveltyDetector(self.pilot, interval=interval)
+        calls = {'n': 0}
+        real_feat_model = part.feat_model
+
+        def counting_call(*a, **kw):
+            calls['n'] += 1
+            return real_feat_model(*a, **kw)
+
+        part.feat_model = counting_call
+        return part, calls
+
+    def test_zero_interval_runs_forward_pass_every_frame(self):
+        part, calls = self._counting_part(interval=0.0)
+        part.run(self.img)
+        part.run(self.img)
+        part.run(self.img)
+        self.assertEqual(calls['n'], 3)
+
+    def test_interval_skips_forward_pass_when_held(self):
+        part, calls = self._counting_part(interval=1.0)
+        with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.0):
+            part.run(self.img)
+        self.assertEqual(calls['n'], 1)
+        with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.5):
+            part.run(self.img)   # within interval -> held, NO forward pass
+        self.assertEqual(calls['n'], 1)
+        with mock.patch('donkeycar.parts.novelty.time.time', return_value=101.5):
+            part.run(self.img)   # past interval -> recompute
+        self.assertEqual(calls['n'], 2)
+
+    def test_held_values_match_last_real_update(self):
+        part, _ = self._counting_part(interval=1.0)
+        with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.0):
+            _, raw1, smoothed1 = part.run(self.img)
+        with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.3):
+            _, raw2, smoothed2 = part.run(self.img)
+        self.assertEqual(raw1, raw2)
+        self.assertEqual(smoothed1, smoothed2)
 
 
 if __name__ == '__main__':

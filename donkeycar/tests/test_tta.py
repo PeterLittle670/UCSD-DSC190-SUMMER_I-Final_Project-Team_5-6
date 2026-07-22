@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 import tensorflow as tf
@@ -98,6 +99,58 @@ class TestTTAStabilityDetector(unittest.TestCase):
         self.assertIsNotNone(score)
         self.assertGreaterEqual(score, 0.0)
         self.assertLessEqual(score, 100.0)
+
+
+class TestTTAStabilityDetectorInterval(unittest.TestCase):
+    # TTA costs M forward passes per update -- the most expensive of the
+    # three signals per update -- so an unthrottled live loop adds real load
+    # (and, on power-constrained hardware like a Pi, real power draw) with no
+    # way to turn it down. This is the interval knob that closes that gap.
+
+    def setUp(self):
+        self.pilot = _tiny_pilot()
+        self.img = (np.random.default_rng(6).random((16, 16, 3)) * 255).astype(np.uint8)
+
+    def _counting_part(self, interval):
+        part = TTAStabilityDetector(self.pilot, num_samples=4,
+                                    interval=interval, seed=0)
+        calls = {'n': 0}
+        real_model = part.model
+
+        def counting_call(*a, **kw):
+            calls['n'] += 1
+            return real_model(*a, **kw)
+
+        part.model = counting_call
+        return part, calls
+
+    def test_zero_interval_runs_forward_pass_every_frame(self):
+        part, calls = self._counting_part(interval=0.0)
+        part.run(self.img)
+        part.run(self.img)
+        part.run(self.img)
+        self.assertEqual(calls['n'], 3)
+
+    def test_interval_skips_forward_pass_when_held(self):
+        part, calls = self._counting_part(interval=1.0)
+        with mock.patch('donkeycar.parts.tta.time.time', return_value=100.0):
+            part.run(self.img)
+        self.assertEqual(calls['n'], 1)
+        with mock.patch('donkeycar.parts.tta.time.time', return_value=100.5):
+            part.run(self.img)   # within interval -> held, NO forward pass
+        self.assertEqual(calls['n'], 1)
+        with mock.patch('donkeycar.parts.tta.time.time', return_value=101.5):
+            part.run(self.img)   # past interval -> recompute
+        self.assertEqual(calls['n'], 2)
+
+    def test_held_values_match_last_real_update(self):
+        part, _ = self._counting_part(interval=1.0)
+        with mock.patch('donkeycar.parts.tta.time.time', return_value=100.0):
+            _, raw1, smoothed1 = part.run(self.img)
+        with mock.patch('donkeycar.parts.tta.time.time', return_value=100.3):
+            _, raw2, smoothed2 = part.run(self.img)
+        self.assertEqual(raw1, raw2)
+        self.assertEqual(smoothed1, smoothed2)
 
 
 if __name__ == '__main__':

@@ -54,6 +54,7 @@ Caveats (read before trusting the numbers):
     ``conv2d_5`` from the default linear model).
 """
 import logging
+import time
 
 import numpy as np
 import tensorflow as tf
@@ -155,6 +156,12 @@ class FeatureNoveltyDetector:
     drive-loop iteration independently of whether MC-Dropout confidence is
     also enabled.
 
+    On slow/power-constrained hardware, ``interval`` rate-limits the forward
+    pass (mirroring ``MCDropoutConfidence``'s ``interval``). Unlike
+    confidence, this part never drives, so between updates it does NOT need a
+    fallback pass to keep steering fresh -- it simply holds the last score and
+    skips the forward pass entirely, which is strictly cheaper.
+
     Run signature::
 
         score, raw_distance, smoothed_distance = part.run(img_arr)
@@ -170,11 +177,22 @@ class FeatureNoveltyDetector:
                              ``donkeycar.parts.mc_calibrate``. Optional.
     :param alpha:            EMA smoothing factor in [0, 1] for the raw
                              distance -- same role as MCDropoutConfidence's.
+    :param interval:         minimum seconds between forward passes. 0 (the
+                             default) updates every frame. Between updates the
+                             last score/distance is held and NO forward pass
+                             runs at all.
     """
 
-    def __init__(self, pilot, calibration_path=None, alpha=0.2):
+    def __init__(self, pilot, calibration_path=None, alpha=0.2, interval=0.0):
         self.alpha = float(alpha)
         self.smoothed_distance = None
+        self.raw_distance = 0.0
+
+        # Minimum seconds between updates. 0 = every frame. This part is a
+        # pure observer (doesn't drive), so a held frame costs nothing --
+        # no fallback pass needed, unlike MCDropoutConfidence.
+        self.interval = float(interval)
+        self.last_update_time = None
 
         interpreter = getattr(pilot, 'interpreter', None)
         self.model = getattr(interpreter, 'model', None)
@@ -211,6 +229,15 @@ class FeatureNoveltyDetector:
         if img_arr is None:
             return self._score(), 0.0, (self.smoothed_distance or 0.0)
 
+        now = time.time()
+        if (self.interval > 0 and self.last_update_time is not None
+                and (now - self.last_update_time) < self.interval):
+            # Rate-limited: skip the forward pass entirely and hold the last
+            # values -- no fallback pass needed since this part never drives.
+            return self._score(), self.raw_distance, \
+                (self.smoothed_distance or 0.0)
+        self.last_update_time = now
+
         norm = normalize_image(img_arr).astype(np.float32)
         feat = self.feat_model(norm[np.newaxis, ...], training=False)
         feat = np.asarray(feat)[0]
@@ -224,6 +251,7 @@ class FeatureNoveltyDetector:
                 mahalanobis_diag(feat, mean, var, active, eps))
         else:
             raw_distance = 0.0
+        self.raw_distance = raw_distance
 
         if self.smoothed_distance is None:
             self.smoothed_distance = raw_distance

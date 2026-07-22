@@ -535,6 +535,11 @@ XAI_CONFIDENCE_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=
 # wrong). See donkeycar.parts.novelty module docstring for the full picture.
 XAI_NOVELTY_ENABLED = False   # master on/off for the novelty signal
 XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
+# Minimum seconds between novelty updates. 0 = every frame (default). Unlike
+# confidence's interval, a held frame here costs NOTHING -- this signal never
+# drives, so between updates it just holds the last score with zero forward
+# passes, instead of falling back to a cheap pass.
+XAI_NOVELTY_INTERVAL = 0.0
 
 # --- Signal 3: test-time augmentation (TTA) stability --------------------
 # Runs the DETERMINISTIC model on M photometrically-augmented copies of the
@@ -549,6 +554,13 @@ XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
 XAI_TTA_ENABLED = False       # master on/off for the TTA stability signal
 XAI_TTA_SAMPLES = 8           # M, number of augmented copies per frame
 XAI_TTA_ALPHA = 0.2           # EMA smoothing of the steering variance
+# Minimum seconds between TTA updates. 0 = every frame (default), which means
+# M forward passes EVERY frame -- the most expensive of the three signals per
+# update. A held frame costs zero forward passes (this signal never drives).
+# If running confidence + novelty + TTA together is straining the hardware
+# (Pi power draw, brownouts), raise this first -- it has the biggest single
+# per-frame cost of the three. E.g. 0.2 caps TTA updates to ~5x/sec.
+XAI_TTA_INTERVAL = 0.0
 XAI_TTA_STRENGTH = 0.2        # photometric jitter strength (0..1); 0 = no augmentation
 
 # --- Throttle scaling (Feature 2) -----------------------------------------
