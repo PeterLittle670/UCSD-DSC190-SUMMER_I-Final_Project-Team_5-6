@@ -45,6 +45,21 @@
   #readout { margin-top: 6px; font-size: 13px; color: #57606a;
              font-variant-numeric: tabular-nums; min-height: 18px; }
   #readout b { color: #24292f; }
+  #layer-explain { margin-top: 10px; padding: 10px 12px; background: #eef6ff;
+                   border: 1px solid #bcdcff; border-radius: 6px;
+                   font-size: 12.5px; line-height: 1.5; color: #1c3d5a; }
+  #layer-explain .term { font-weight: 700; color: #0969da; }
+  #layer-explain .tech { font-weight: 400; color: #57606a; font-size: 11.5px; }
+  .glossary-toggle { background: none; border: none; color: #0969da;
+                      font: inherit; font-size: 12px; cursor: pointer;
+                      padding: 2px 0; text-decoration: underline; }
+  .glossary-toggle:hover { color: #0550ae; }
+  #glossary { display: none; margin-top: 8px; padding: 10px 12px;
+              background: #f6f8fa; border: 1px solid #d8dee4;
+              border-radius: 6px; font-size: 12.5px; line-height: 1.6; }
+  #glossary dt { font-weight: 700; color: #24292f; margin-top: 6px; }
+  #glossary dt:first-child { margin-top: 0; }
+  #glossary dd { margin: 2px 0 0 0; color: #444d56; }
   #graph { width: 100%; height: 170px; display: block; cursor: crosshair; }
   .graph-title { font-size: 12px; color: #57606a; margin: 0 0 6px 2px; }
   .legend { font-size: 11px; color: #57606a; margin-top: 4px; }
@@ -76,19 +91,45 @@
       </label>
       <label>layer
         <select id="layer">
-          <option value="overlay" selected>uncertainty overlay</option>
-          <option value="attention">mean attention (Grad-CAM)</option>
-          <option value="attention_pp">attention++ (Grad-CAM++)</option>
-          <option value="novelty">novelty (OOD)</option>
-          <option value="saliency">saliency (pixel gradient)</option>
-          <option value="integrated_gradients">integrated gradients</option>
-          <option value="orig">camera only</option>
+          <option value="overlay" selected>Where the model was unsure (uncertainty)</option>
+          <option value="attention">Where the model looked (Grad-CAM)</option>
+          <option value="attention_pp">Where the model looked, sharper (Grad-CAM++)</option>
+          <option value="novelty">Have I seen this before? (novelty)</option>
+          <option value="saliency">Exact pixels that mattered (saliency)</option>
+          <option value="integrated_gradients">Exact pixels that mattered, cleaner (integrated gradients)</option>
+          <option value="orig">Just the camera</option>
         </select>
       </label>
       <label><input type="checkbox" id="analyzed-only"> analysed frames only</label>
     </div>
+    <div id="layer-explain"></div>
     <input type="range" id="scrub" min="0" max="0" value="0" step="1">
     <div id="readout"></div>
+    <button class="glossary-toggle" id="glossary-btn" type="button">What do confidence / novelty / stability / variance mean? ▾</button>
+    <dl id="glossary">
+      <dt>variance</dt>
+      <dd>The raw, uncalibrated number underneath every % score below. On its
+        own it isn't meaningful (its scale depends on this specific model) --
+        the percentages are what you should actually read.</dd>
+      <dt>confidence %</dt>
+      <dd>Ask the model the same question 15 times, each time with a random
+        slice of its "brain" (dropout) switched off -- like asking 15 slightly
+        different clones. If the clones agree, confidence is high. This
+        measures whether the model agrees with <em>itself</em>, not whether
+        it's actually right.</dd>
+      <dt>novelty %</dt>
+      <dd>How far this scene's internal features are from anything the model
+        saw during training -- "does this remind me of anything I've driven
+        through before?" A model can be confident (its clones agree) about a
+        scene it has never truly seen, which novelty is built to catch.</dd>
+      <dt>TTA stability %</dt>
+      <dd>Show the model the same photo 8 times, each time with the
+        brightness/contrast/noise tweaked slightly -- like showing a photo at
+        noon, at dusk, through foggy glasses. If the answer barely changes,
+        stability is high. A low score means the model is fragile to
+        lighting/noise, a different failure mode from low confidence or high
+        novelty.</dd>
+    </dl>
   </div>
 
   <div class="panel">
@@ -112,7 +153,75 @@
   const img = $('frame-img'), badge = $('badge'), scrub = $('scrub'),
         playBtn = $('play'), fpsSel = $('fps'), layerSel = $('layer'),
         analyzedOnly = $('analyzed-only'), readout = $('readout'),
-        canvas = $('graph');
+        canvas = $('graph'), layerExplain = $('layer-explain'),
+        glossaryBtn = $('glossary-btn'), glossary = $('glossary');
+
+  // Plain-language explanation for whichever layer is currently selected,
+  // technical name kept alongside rather than removed -- same information for
+  // every reader, just introduced before the jargon instead of instead of it.
+  const LAYER_INFO = {
+    overlay: {
+      term: 'Where the model was unsure', tech: 'uncertainty / Grad-CAM variance',
+      text: 'Runs Grad-CAM once per dropout sub-network, then highlights spots ' +
+            'where those sub-networks pointed at different things. Bright = ' +
+            'the sub-networks disagreed about where to look here.'
+    },
+    attention: {
+      term: 'Where the model looked', tech: 'Grad-CAM',
+      text: 'Shows which part of the image most influenced the steering ' +
+            'decision, averaged across the sub-networks. Bright = this region ' +
+            'mattered a lot to the prediction.'
+    },
+    attention_pp: {
+      term: 'Where the model looked, sharper', tech: 'Grad-CAM++',
+      text: 'A refined version of the map above: gives more credit to pixels ' +
+            'that individually pushed the prediction hardest, so it can show ' +
+            'several important regions clearly (e.g. both lane lines) instead ' +
+            'of blurring them into one blob.'
+    },
+    novelty: {
+      term: 'Have I seen this before?', tech: 'feature-space novelty / OOD',
+      text: 'Shows which parts of the image look unlike anything in the ' +
+            'training data -- about familiarity, not confidence. A model can ' +
+            'be confident (its sub-networks agree) about a scene it has never ' +
+            'truly seen; this layer is built to catch exactly that case.'
+    },
+    saliency: {
+      term: 'Exact pixels that mattered', tech: 'vanilla-gradient saliency',
+      text: 'Instead of coarse regions, this asks pixel-by-pixel: how much ' +
+            'would changing this exact pixel change the steering prediction? ' +
+            'Tends to look speckled/noisy -- that is a real property of this ' +
+            'technique, not a bug.'
+    },
+    integrated_gradients: {
+      term: 'Exact pixels that mattered, cleaner', tech: 'Integrated Gradients',
+      text: 'A more rigorous version of the pixel map above. Instead of one ' +
+            'noisy snapshot, it averages pixel-importance along a path from a ' +
+            'blank black image up to the real photo, cancelling out a lot of ' +
+            'the speckle.'
+    },
+    orig: {
+      term: 'Just the camera', tech: '',
+      text: 'No AI overlay -- the plain camera frame, for reference against ' +
+            'the layers above.'
+    },
+  };
+
+  function updateLayerExplain() {
+    const info = LAYER_INFO[layerSel.value];
+    if (!info) { layerExplain.innerHTML = ''; return; }
+    layerExplain.innerHTML =
+      '<span class="term">' + info.term + '</span>' +
+      (info.tech ? ' <span class="tech">(' + info.tech + ')</span>' : '') +
+      ' &mdash; ' + info.text;
+  }
+
+  glossaryBtn.addEventListener('click', () => {
+    const open = glossary.style.display === 'block';
+    glossary.style.display = open ? 'none' : 'block';
+    glossaryBtn.textContent = (open ? 'What do confidence / novelty / '
+      + 'stability / variance mean? ▾' : 'Hide glossary ▴');
+  });
 
   const PLACEHOLDER = 'data:image/svg+xml;utf8,' + encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240">' +
@@ -178,6 +287,7 @@
     const entry = timeline[pos];
     const f = data.frames && data.frames[String(entry.index)];
 
+    updateLayerExplain();
     const src = entryImage(entry);
     img.onerror = () => { img.onerror = null; img.src = PLACEHOLDER;
                           showBadge('frame image unavailable'); };

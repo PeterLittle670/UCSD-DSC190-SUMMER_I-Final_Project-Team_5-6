@@ -157,6 +157,17 @@ var driveHandler = new function() {
         toggleBrake();
       });
 
+      // Plain-language "what does this mean?" toggles on the confidence/
+      // novelty/TTA panels. Delegated so any future XAI panel with the same
+      // markup pattern (.xai-explain-toggle + data-target) works for free.
+      $(document).on('click', '.xai-explain-toggle', function () {
+        var $btn = $(this);
+        var $panel = $('#' + $btn.data('target'));
+        var opening = $panel.css('display') === 'none';
+        $panel.slideToggle(120);
+        $btn.html(opening ? 'Hide &#9652;' : 'What does this mean? &#9662;');
+      });
+
       $('input[type=radio][name=controlMode]').change(function() {
         if (this.value == 'joystick') {
           state.controlMode = "joystick";
