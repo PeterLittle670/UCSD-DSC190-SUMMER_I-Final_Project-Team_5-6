@@ -2,7 +2,6 @@ import unittest
 from unittest import mock
 
 import numpy as np
-import tensorflow as tf
 
 from donkeycar.parts.novelty import (mahalanobis_diag, fit_diagonal_gaussian,
                                      FeatureNoveltyDetector)
@@ -62,70 +61,80 @@ class TestFitDiagonalGaussian(unittest.TestCase):
         self.assertTrue(all(active[i] for i in (0, 1, 3)))
 
 
-def _tiny_pilot():
-    """A minimal model with a layer named 'dense_2', the surface
-    FeatureNoveltyDetector reaches for, wrapped in a stub pilot exposing
-    .interpreter.model."""
-    tf.random.set_seed(0)
-    inp = tf.keras.Input((8, 8, 3))
-    x = tf.keras.layers.Flatten()(inp)
-    feat = tf.keras.layers.Dense(5, name='dense_2')(x)
-    out = tf.keras.layers.Dense(1, name='n_outputs0')(feat)
-    model = tf.keras.Model(inp, out)
+class _StubExtractor:
+    """Stand-in for the generic-encoder feature extractor: returns a fixed
+    feature vector and counts how many times it actually ran, so we can test
+    the detector's rate-limiting without downloading a real ImageNet model."""
+    def __init__(self, feat):
+        self.feat = np.asarray(feat, dtype=np.float32)
+        self.calls = 0
 
-    class _Interp:
-        def __init__(self, m):
-            self.model = m
+    def extract(self, img):
+        self.calls += 1
+        return self.feat
 
-    class _Pilot:
-        def __init__(self, m):
-            self.interpreter = _Interp(m)
 
-    return _Pilot(model)
+def _novelty_part_with_stub(feat_dim=5, interval=0.0):
+    """A FeatureNoveltyDetector with a stub extractor + a minimal novelty_ood
+    calibration block injected, bypassing encoder construction/download."""
+    part = FeatureNoveltyDetector(None, interval=interval)
+    part.calibration = {
+        'mean': [0.0] * feat_dim,
+        'var': [1.0] * feat_dim,
+        'active_dims': [True] * feat_dim,
+        'eps': 1e-6,
+        'score_anchors': {'distance': [0.0, 10.0, 100.0],
+                          'score': [2.0, 50.0, 98.0]},
+    }
+    part.extractor = _StubExtractor(np.full(feat_dim, 2.0))
+    return part
+
+
+class TestFeatureNoveltyDetectorScoring(unittest.TestCase):
+
+    def test_run_computes_distance_and_score_from_encoder_features(self):
+        part = _novelty_part_with_stub(feat_dim=5)
+        # feat = 2.0 in each of 5 dims, mean 0 var 1 -> distance = 5 * 2^2 = 20
+        score, raw, smoothed = part.run(np.zeros((8, 8, 3), np.uint8))
+        self.assertAlmostEqual(raw, 20.0, places=4)
+        self.assertIsNotNone(score)
+        self.assertGreaterEqual(score, 0.0)
+        self.assertLessEqual(score, 100.0)
+
+    def test_no_calibration_means_no_score(self):
+        part = FeatureNoveltyDetector(None)   # no calib, no extractor
+        score, raw, smoothed = part.run(np.zeros((8, 8, 3), np.uint8))
+        self.assertIsNone(score)
+        self.assertEqual(raw, 0.0)
 
 
 class TestFeatureNoveltyDetectorInterval(unittest.TestCase):
     # Rate-limiting matters here: this part rides alongside the driving pilot
-    # on every frame, so an unthrottled forward pass adds real load (and, on
-    # a Pi, real power draw) with no way to turn it down.
+    # on every frame, and the encoder pass is heavier than the old single
+    # steering-model pass -- so an unthrottled loop adds real load / power draw.
 
     def setUp(self):
-        self.pilot = _tiny_pilot()
-        self.img = (np.random.default_rng(0).random((8, 8, 3)) * 255).astype(np.uint8)
+        self.img = np.zeros((8, 8, 3), np.uint8)
 
-    def _counting_part(self, interval):
-        part = FeatureNoveltyDetector(self.pilot, interval=interval)
-        calls = {'n': 0}
-        real_feat_model = part.feat_model
+    def test_zero_interval_runs_encoder_every_frame(self):
+        part = _novelty_part_with_stub(interval=0.0)
+        part.run(self.img); part.run(self.img); part.run(self.img)
+        self.assertEqual(part.extractor.calls, 3)
 
-        def counting_call(*a, **kw):
-            calls['n'] += 1
-            return real_feat_model(*a, **kw)
-
-        part.feat_model = counting_call
-        return part, calls
-
-    def test_zero_interval_runs_forward_pass_every_frame(self):
-        part, calls = self._counting_part(interval=0.0)
-        part.run(self.img)
-        part.run(self.img)
-        part.run(self.img)
-        self.assertEqual(calls['n'], 3)
-
-    def test_interval_skips_forward_pass_when_held(self):
-        part, calls = self._counting_part(interval=1.0)
+    def test_interval_skips_encoder_when_held(self):
+        part = _novelty_part_with_stub(interval=1.0)
         with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.0):
             part.run(self.img)
-        self.assertEqual(calls['n'], 1)
+        self.assertEqual(part.extractor.calls, 1)
         with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.5):
-            part.run(self.img)   # within interval -> held, NO forward pass
-        self.assertEqual(calls['n'], 1)
+            part.run(self.img)   # within interval -> held, NO encoder pass
+        self.assertEqual(part.extractor.calls, 1)
         with mock.patch('donkeycar.parts.novelty.time.time', return_value=101.5):
             part.run(self.img)   # past interval -> recompute
-        self.assertEqual(calls['n'], 2)
+        self.assertEqual(part.extractor.calls, 2)
 
     def test_held_values_match_last_real_update(self):
-        part, _ = self._counting_part(interval=1.0)
+        part = _novelty_part_with_stub(interval=1.0)
         with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.0):
             _, raw1, smoothed1 = part.run(self.img)
         with mock.patch('donkeycar.parts.novelty.time.time', return_value=100.3):

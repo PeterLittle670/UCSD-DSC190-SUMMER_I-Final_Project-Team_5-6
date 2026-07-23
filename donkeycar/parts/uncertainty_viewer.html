@@ -65,6 +65,13 @@
   .legend { font-size: 11px; color: #57606a; margin-top: 4px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 4px;
          vertical-align: middle; margin: 0 3px 0 8px; }
+  .series-legend { display: flex; flex-wrap: wrap; gap: 4px 16px;
+                    margin-top: 8px; font-size: 12.5px; }
+  .series-item { display: inline-flex; align-items: center; gap: 5px;
+                 cursor: pointer; user-select: none; color: #24292f; }
+  .series-item input[type="checkbox"] { margin: 0; cursor: pointer; }
+  .series-item input:disabled ~ .dot { opacity: .35; }
+  .series-item:has(input:disabled) { color: #8b949e; cursor: default; }
   .hint { font-size: 11px; color: #8b949e; margin-top: 8px; }
 </style>
 </head>
@@ -133,16 +140,18 @@
   </div>
 
   <div class="panel">
-    <p class="graph-title" id="graph-title">Confidence over drive</p>
+    <p class="graph-title" id="graph-title">Signals over drive</p>
     <canvas id="graph"></canvas>
+    <div class="series-legend" id="series-legend"></div>
     <div class="legend">
       <span class="dot" style="background:#fb8c00"></span>analysed frame (has
-      uncertainty map)
-      <span class="dot" style="background:#d32f2f"></span>current position
+      overlay images)
+      <span class="dot" style="background:#24292f"></span>current position
       &mdash; click the graph to jump
     </div>
-    <p class="hint">Relative per-model MC-Dropout signal, not a calibrated
-      probability. Space = play/pause, &larr;/&rarr; = step.</p>
+    <p class="hint">Relative per-model signal, not a calibrated probability.
+      Independent of the layer dropdown above -- tick/untick to compare.
+      Space = play/pause, &larr;/&rarr; = step.</p>
   </div>
 </main>
 
@@ -231,7 +240,19 @@
     'unavailable</text></svg>');
 
   let data = null, timeline = [], analyzedPos = [], pos = 0, timer = null;
-  let useConfidence = false, varMax = 1;
+
+  // Graph series are the full-timeline scalar signals -- deliberately
+  // independent of the image-layer dropdown above, since most image layers
+  // (Grad-CAM++, saliency, integrated gradients) only have a value for the
+  // analysed top-K frames, not a per-frame number across the whole drive.
+  // Tick/untick any combination to compare signals directly.
+  const SERIES_DEFS = [
+    { key: 'confidence', label: 'Confidence', color: '#0969da' },
+    { key: 'novelty_score', label: 'Novelty', color: '#cf222e' },
+    { key: 'tta_stability', label: 'TTA stability', color: '#1a7f37' },
+  ];
+  let series = [];       // [{key,label,color,enabled}] -- what actually got drawn
+  let usingRawFallback = false, varMax = 1;
 
   fetch('data.json').then(r => {
     if (!r.ok) throw new Error('data.json not found (' + r.status + ')');
@@ -244,22 +265,54 @@
     timeline.forEach((e, i) => {
       if (d.frames && d.frames[String(e.index)]) analyzedPos.push(i);
     });
-    useConfidence = timeline.some(e => e.confidence !== null &&
-                                       e.confidence !== undefined);
-    varMax = Math.max(1e-9, ...timeline.map(e => e.variance || 0));
+
+    series = SERIES_DEFS
+      .filter(s => timeline.some(e => e[s.key] !== null && e[s.key] !== undefined))
+      .map(s => ({ ...s, enabled: true }));
+    usingRawFallback = series.length === 0;
+    if (usingRawFallback) {
+      // No calibrated % signal anywhere in this timeline (e.g. no calib.json
+      // when this analysis was run) -- fall back to the one thing every
+      // timeline always has: raw steering variance.
+      series = [{ key: 'variance', label: 'Steering variance (raw)',
+                 color: '#0969da', enabled: true, raw: true }];
+      varMax = Math.max(1e-9, ...timeline.map(e => e.variance || 0));
+    }
+    buildSeriesLegend();
 
     $('meta').textContent =
       d.model + ' · ' + (d.tub || '') + ' · N=' + d.num_passes +
       ' · ' + d.n_analyzed + '/' + d.n_records +
       ' frames analysed · ' + (d.created || '');
-    $('graph-title').textContent = useConfidence ?
-      'Confidence over drive (%)' : 'Steering variance over drive';
+    $('graph-title').textContent = usingRawFallback ?
+      'Steering variance over drive' : 'Signals over drive (%)';
     scrub.max = timeline.length - 1;
     seek(analyzedPos.length ? analyzedPos[0] : 0);
     window.addEventListener('resize', drawGraph);
   }).catch(err => {
     $('meta').textContent = 'Error: ' + err.message;
   });
+
+  function buildSeriesLegend() {
+    const el = $('series-legend');
+    el.innerHTML = '';
+    series.forEach(s => {
+      const label = document.createElement('label');
+      label.className = 'series-item';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = s.enabled;
+      cb.disabled = usingRawFallback;   // nothing to toggle with just one series
+      cb.addEventListener('change', () => { s.enabled = cb.checked; drawGraph(); });
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = s.color;
+      label.appendChild(cb);
+      label.appendChild(dot);
+      label.appendChild(document.createTextNode(s.label));
+      el.appendChild(label);
+    });
+  }
 
   function entryImage(entry) {
     const f = data.frames && data.frames[String(entry.index)];
@@ -360,11 +413,10 @@
     if (e.code === 'ArrowLeft') { pause(); stepBack(); }
   });
 
-  // ---- confidence graph --------------------------------------------------
-  function yValue(e) {
-    return useConfidence ?
-      (e.confidence === null || e.confidence === undefined ? 0 : e.confidence)
-      : (e.variance || 0);
+  // ---- signals graph -------------------------------------------------------
+  function seriesValue(s, e) {
+    const v = s.raw ? (e.variance || 0) : e[s.key];
+    return (v === null || v === undefined) ? null : v;
   }
   function drawGraph() {
     if (!timeline.length) return;
@@ -373,7 +425,7 @@
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
     const pad = { l: 40 * dpr, r: 8 * dpr, t: 8 * dpr, b: 20 * dpr };
-    const yMax = useConfidence ? 100 : varMax * 1.05;
+    const yMax = usingRawFallback ? varMax * 1.05 : 100;
     const n = timeline.length;
     const x = i => pad.l + (n === 1 ? 0 : i / (n - 1)) * (W - pad.l - pad.r);
     const y = v => H - pad.b - (v / yMax) * (H - pad.t - pad.b);
@@ -382,34 +434,44 @@
     ctx.strokeStyle = '#d8dee4'; ctx.fillStyle = '#8b949e';
     ctx.lineWidth = dpr; ctx.font = (10 * dpr) + 'px sans-serif';
     ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
-    const ticks = useConfidence ? [0, 25, 50, 75, 100]
-                                : [0, yMax / 2, yMax];
+    const ticks = usingRawFallback ? [0, yMax / 2, yMax] : [0, 25, 50, 75, 100];
     ticks.forEach(tv => {
       ctx.beginPath(); ctx.moveTo(pad.l, y(tv)); ctx.lineTo(W - pad.r, y(tv));
       ctx.stroke();
-      ctx.fillText(useConfidence ? tv : tv.toExponential(0),
+      ctx.fillText(usingRawFallback ? tv.toExponential(0) : tv,
                    pad.l - 5 * dpr, y(tv));
     });
 
-    // series
-    ctx.strokeStyle = '#0969da'; ctx.lineWidth = 1.4 * dpr;
-    ctx.beginPath();
-    timeline.forEach((e, i) => {
-      const px = x(i), py = y(yValue(e));
-      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    // one polyline per ticked series; a null/undefined value breaks the line
+    // into a gap instead of dropping to 0 (which would misread as "measured
+    // zero" rather than "no data this frame").
+    series.forEach(s => {
+      if (!s.enabled) return;
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.4 * dpr;
+      ctx.beginPath();
+      let drawing = false;
+      timeline.forEach((e, i) => {
+        const v = seriesValue(s, e);
+        if (v === null) { drawing = false; return; }
+        const px = x(i), py = y(v);
+        if (!drawing) { ctx.moveTo(px, py); drawing = true; }
+        else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
     });
-    ctx.stroke();
 
-    // analysed markers
+    // analysed-frame markers: a fixed row along the top edge, independent of
+    // which series are ticked (an analysed frame has overlay images
+    // regardless of which scalar signal you're currently comparing).
     ctx.fillStyle = '#fb8c00';
     analyzedPos.forEach(i => {
       ctx.beginPath();
-      ctx.arc(x(i), y(yValue(timeline[i])), 2.6 * dpr, 0, 7);
+      ctx.arc(x(i), pad.t + 3 * dpr, 2.2 * dpr, 0, 7);
       ctx.fill();
     });
 
     // cursor
-    ctx.strokeStyle = '#d32f2f'; ctx.lineWidth = 1.6 * dpr;
+    ctx.strokeStyle = '#24292f'; ctx.lineWidth = 1.6 * dpr;
     ctx.beginPath(); ctx.moveTo(x(pos), pad.t);
     ctx.lineTo(x(pos), H - pad.b); ctx.stroke();
   }

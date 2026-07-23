@@ -6,18 +6,29 @@ model's dropout sub-networks *agree* with each other -- an ambiguity signal.
 It does NOT measure whether the current input looks anything like the data
 the model was trained on: a scene the network has never seen can still get a
 confident, low-variance (wrong) answer if its sub-networks happen to agree.
-This module adds the complementary signal: how far the current frame's
-internal feature representation is from the training distribution, via
-Mahalanobis distance on the model's own learned features.
+This module adds the complementary signal: how far the current frame is from
+the training distribution, via Mahalanobis distance in a feature space.
 
-Two independent consumers share the math and calibration schema here:
+WHICH feature space matters a lot. The live ``FeatureNoveltyDetector`` now
+measures distance in a GENERIC image encoder's features (see
+``donkeycar.parts.ood``), NOT the steering model's own ``dense_2`` layer. The
+steering model is trained only to predict an angle, so it discards the scene
+content (texture/colour/semantics) that distinguishes grass from track --
+measuring novelty there barely responded to genuinely different scenes. The
+generic encoder keeps that content, so the same Mahalanobis math actually
+separates scenes. This module still owns the distance math; the feature
+source moved to ``donkeycar.parts.ood``.
+
+Consumers:
   * ``FeatureNoveltyDetector`` -- a live Part computing one scalar novelty
-    score per frame, cheap enough to run every drive-loop iteration
-    (a single deterministic forward pass to the ``dense_2`` layer, no
-    MC-Dropout stochasticity needed since this isn't measuring agreement).
+    score per frame from generic-encoder features (one encoder forward pass;
+    no MC-Dropout stochasticity needed since this isn't measuring agreement).
   * ``donkeycar.parts.gradcam_uncertainty`` -- reuses ``mahalanobis_diag``
-    directly on ``conv2d_5`` features (pooled across space) to render a
-    spatial "where is this unfamiliar" heatmap for offline analysis.
+    directly on the steering model's ``conv2d_5`` features (pooled across
+    space) to render a spatial "where is this unfamiliar" heatmap for offline
+    analysis. NOTE: this offline spatial map still uses the steering model's
+    features and so inherits the task-collapse limitation above; it is a
+    lower-priority, coarse localisation aid, not the primary novelty signal.
 
 Caveats (read before trusting the numbers):
   * **Diagonal covariance only.** Feature dimensions are treated as
@@ -54,6 +65,7 @@ Caveats (read before trusting the numbers):
     ``conv2d_5`` from the default linear model).
 """
 import logging
+import os
 import time
 
 import numpy as np
@@ -144,23 +156,31 @@ def fit_diagonal_gaussian(feature_matrix, min_var_frac=1e-3, abs_eps=1e-6):
 class FeatureNoveltyDetector:
     """
     DonkeyCar Part. Computes a live "novelty" score for each frame: how far
-    the frame's ``dense_2`` feature vector is from the distribution seen
-    during training, via diagonal-covariance Mahalanobis distance.
+    the frame sits from the training distribution, via diagonal-covariance
+    Mahalanobis distance in the feature space of a GENERIC image encoder (see
+    ``donkeycar.parts.ood``).
+
+    IMPORTANT -- this used to measure distance in the steering model's own
+    ``dense_2`` layer, but that feature space is task-collapsed: a model
+    trained only to predict steering discards texture/colour/semantics, so
+    grass, carpet and open track all mapped to nearly identical features and
+    the score barely moved (it only reacted to gross changes like a covered
+    camera). It now uses a separate ImageNet-pretrained encoder that keeps
+    that scene content, which actually separates different scenes -- see the
+    ``donkeycar.parts.ood`` module docstring for the measured before/after.
 
     Unlike ``MCDropoutConfidence``, this is a pure auxiliary observer -- it
     does NOT produce steering/throttle, and rides alongside whichever part
-    already drives the car (the plain pilot or the MC-Dropout pilot). A
-    single deterministic forward pass per frame is enough (no dropout
-    stochasticity needed -- novelty is a distance-from-training-distribution
-    measure, not an agreement measure), so this is cheap enough to run every
-    drive-loop iteration independently of whether MC-Dropout confidence is
-    also enabled.
+    already drives the car. One encoder forward pass per frame (no dropout
+    stochasticity needed -- novelty is a distance-from-training measure). The
+    encoder is independent of the steering pilot; the ``pilot`` argument is
+    kept only for call-site compatibility and is not used.
 
-    On slow/power-constrained hardware, ``interval`` rate-limits the forward
-    pass (mirroring ``MCDropoutConfidence``'s ``interval``). Unlike
-    confidence, this part never drives, so between updates it does NOT need a
-    fallback pass to keep steering fresh -- it simply holds the last score and
-    skips the forward pass entirely, which is strictly cheaper.
+    On slow/power-constrained hardware, ``interval`` rate-limits the encoder
+    pass (mirroring ``MCDropoutConfidence``'s ``interval``). This part never
+    drives, so between updates it holds the last score and skips the encoder
+    pass entirely -- important, since the encoder is heavier than the old
+    single steering-model pass.
 
     Run signature::
 
@@ -168,22 +188,23 @@ class FeatureNoveltyDetector:
 
     ``score`` is a 0-100 novelty % derived from the calibration file (see
     ``donkeycar.parts.mc_calibrate``), or ``None`` if the model has no
-    calibration, or an older calibration made before novelty stats existed.
+    calibration with a ``novelty_ood`` block, or the encoder could not be
+    loaded.
 
-    :param pilot:            a loaded KerasPilot (KerasLinear). Its
-                             underlying Keras model is reused directly -- no
-                             separate load.
-    :param calibration_path: path to a ``<model>.calib.json`` produced by
+    :param pilot:            kept for call-site compatibility; unused (novelty
+                             now uses its own encoder, not the pilot's model).
+    :param calibration_path: path to a ``<model>.calib.json`` with a
+                             ``novelty_ood`` block, produced by
                              ``donkeycar.parts.mc_calibrate``. Optional.
     :param alpha:            EMA smoothing factor in [0, 1] for the raw
                              distance -- same role as MCDropoutConfidence's.
-    :param interval:         minimum seconds between forward passes. 0 (the
+    :param interval:         minimum seconds between encoder passes. 0 (the
                              default) updates every frame. Between updates the
-                             last score/distance is held and NO forward pass
-                             runs at all.
+                             last score/distance is held and NO pass runs.
     """
 
-    def __init__(self, pilot, calibration_path=None, alpha=0.2, interval=0.0):
+    def __init__(self, pilot=None, calibration_path=None, alpha=0.2,
+                 interval=0.0):
         self.alpha = float(alpha)
         self.smoothed_distance = None
         self.raw_distance = 0.0
@@ -194,36 +215,60 @@ class FeatureNoveltyDetector:
         self.interval = float(interval)
         self.last_update_time = None
 
-        interpreter = getattr(pilot, 'interpreter', None)
-        self.model = getattr(interpreter, 'model', None)
-        if self.model is None or not callable(self.model):
-            raise ValueError(
-                'FeatureNoveltyDetector requires a Keras pilot with a '
-                'callable model (the default KerasInterpreter). '
-                'TFLite/TensorRT interpreters are not supported.')
+        self.extractor = None      # OOD feature extractor (generic encoder)
+        self.calibration = None    # the 'novelty_ood' calib block
 
-        self.feat_model = tf.keras.Model(
-            self.model.inputs, self.model.get_layer('dense_2').output)
-
-        self.calibration = None
         if calibration_path:
             try:
                 from donkeycar.parts.mc_calibrate import load_calibration
                 calib = load_calibration(calibration_path)
-                self.calibration = calib.get('novelty_global')
-                if self.calibration is None:
+                block = calib.get('novelty_ood')
+                if block is None:
                     logger.warning(
                         f'FeatureNoveltyDetector: {calibration_path} has no '
-                        f'"novelty_global" stats (older calibration?); '
-                        f'novelty score will be unavailable -- re-run '
-                        f'mc_calibrate to add novelty stats.')
+                        f'"novelty_ood" stats (older calibration, or built '
+                        f'before the encoder-based novelty fix); novelty will '
+                        f'be unavailable -- re-run mc_calibrate to add it.')
                 else:
-                    logger.info(f'FeatureNoveltyDetector: loaded novelty '
-                                f'calibration from {calibration_path}')
+                    self._load_encoder(block, calibration_path)
+                    if self.extractor is not None:
+                        self.calibration = block
+                        logger.info(f'FeatureNoveltyDetector: loaded '
+                                    f'encoder-based novelty calibration from '
+                                    f'{calibration_path}')
             except Exception as e:
                 logger.warning(f'FeatureNoveltyDetector: could not load '
                                f'calibration {calibration_path} ({e}); '
                                f'novelty score will be unavailable.')
+
+    def _load_encoder(self, block, calibration_path):
+        """Prefer the encoder sidecar saved next to the calibration (so a Pi
+        driving offline needs no weight download); fall back to rebuilding the
+        encoder from ImageNet weights (needs the cache/internet)."""
+        from donkeycar.parts.ood import CPUEncoderExtractor
+        ef = block.get('encoder_file')
+        if ef and calibration_path:
+            sidecar = os.path.join(
+                os.path.dirname(os.path.abspath(calibration_path)), ef)
+            if os.path.exists(sidecar):
+                try:
+                    m = tf.keras.models.load_model(sidecar, compile=False)
+                    self.extractor = CPUEncoderExtractor(
+                        block['encoder'], model=m)
+                    logger.info(f'FeatureNoveltyDetector: loaded OOD encoder '
+                                f'sidecar {sidecar}')
+                    return
+                except Exception as e:
+                    logger.warning(f'FeatureNoveltyDetector: encoder sidecar '
+                                   f'load failed ({e}); rebuilding from '
+                                   f'ImageNet weights.')
+        try:
+            self.extractor = CPUEncoderExtractor(
+                block['encoder'], block.get('input_size'),
+                block.get('alpha', 1.0))
+        except Exception as e:
+            logger.warning(f'FeatureNoveltyDetector: could not build OOD '
+                           f'encoder ({e}); novelty will be unavailable.')
 
     def run(self, img_arr):
         if img_arr is None:
@@ -232,17 +277,14 @@ class FeatureNoveltyDetector:
         now = time.time()
         if (self.interval > 0 and self.last_update_time is not None
                 and (now - self.last_update_time) < self.interval):
-            # Rate-limited: skip the forward pass entirely and hold the last
+            # Rate-limited: skip the encoder pass entirely and hold the last
             # values -- no fallback pass needed since this part never drives.
             return self._score(), self.raw_distance, \
                 (self.smoothed_distance or 0.0)
         self.last_update_time = now
 
-        norm = normalize_image(img_arr).astype(np.float32)
-        feat = self.feat_model(norm[np.newaxis, ...], training=False)
-        feat = np.asarray(feat)[0]
-
-        if self.calibration is not None:
+        if self.calibration is not None and self.extractor is not None:
+            feat = self.extractor.extract(img_arr)
             mean = np.array(self.calibration['mean'])
             var = np.array(self.calibration['var'])
             active = np.array(self.calibration['active_dims'])

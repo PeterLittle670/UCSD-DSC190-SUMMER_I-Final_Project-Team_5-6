@@ -342,13 +342,14 @@ def _collect_novelty(records, model_path, cfg, calib, progress_callback=None):
     Get a per-frame smoothed novelty (Mahalanobis) distance list, preferring
     values logged in the tub, else replaying through FeatureNoveltyDetector.
     Returns a list of raw floats (distances, NOT scores) the same length as
-    `records`, or None if no 'novelty_global' calibration is available at all
-    (nothing to score against).
+    `records`, or None if no 'novelty_ood' calibration is available at all
+    (nothing to score against). Distances are in the generic-encoder feature
+    space, so they must be scored with the 'novelty_ood' anchors.
 
     :param progress_callback: optional ``callback(stage, current, total)``,
                               called as frames are processed (stage='novelty').
     """
-    if calib is None or calib.get('novelty_global') is None:
+    if calib is None or calib.get('novelty_ood') is None:
         return None
 
     logged = [r.underlying.get('pilot/smoothed_novelty_distance')
@@ -483,9 +484,9 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                                          progress_callback=progress_callback)
 
     def nov_score(d):
-        if calib is None or calib.get('novelty_global') is None or d is None:
+        if calib is None or calib.get('novelty_ood') is None or d is None:
             return None
-        return novelty_distance_to_score(d, calib['novelty_global'])
+        return novelty_distance_to_score(d, calib['novelty_ood'])
 
     # Per-frame TTA (test-time augmentation) stability timeline -- cheap-ish,
     # every frame, independent of the Grad-CAM frame selection. None if the

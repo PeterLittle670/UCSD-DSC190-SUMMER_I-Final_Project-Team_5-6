@@ -70,7 +70,9 @@ def build_calibration(smoothed_variances, num_passes, alpha,
                       percentiles=DEFAULT_PERCENTILES, model_path=None,
                       dense2_features=None, conv5_features=None,
                       tta_variances=None, tta_num_samples=None,
-                      tta_strength=None, tta_alpha=None):
+                      tta_strength=None, tta_alpha=None,
+                      ood_features=None, ood_encoder=None, ood_input_size=None,
+                      ood_alpha=1.0, ood_encoder_file=None):
     """
     Turn a collected distribution of smoothed variances into a calibration
     dict (JSON-serialisable). Optionally also fits novelty-detection
@@ -136,6 +138,10 @@ def build_calibration(smoothed_variances, num_passes, alpha,
         calib['tta'] = _build_tta_block(
             tta_variances, tta_num_samples, tta_strength, tta_alpha,
             percentiles)
+    if ood_features is not None:
+        calib['novelty_ood'] = _build_ood_block(
+            ood_features, ood_encoder, ood_input_size, ood_alpha,
+            ood_encoder_file, percentiles)
 
     return calib
 
@@ -174,6 +180,28 @@ def _build_tta_block(tta_variances, num_samples, strength, alpha,
         'note': ('Robustness of the prediction to photometric input '
                  'perturbation. Relative per-model signal, not a probability.'),
     }
+
+
+def _build_ood_block(ood_features, encoder_name, input_size, alpha,
+                     encoder_file, percentiles=DEFAULT_PERCENTILES):
+    """
+    Build the live-novelty calibration block from GENERIC-ENCODER features
+    (see donkeycar.parts.ood for why this replaces the task-collapsed
+    steering-model features). Reuses the same diagonal-Gaussian /
+    percentile-anchor machinery as the legacy novelty block, plus the encoder
+    metadata the drive-time detector needs to rebuild/validate the matching
+    extractor.
+    """
+    block = _build_novelty_block(
+        np.asarray(ood_features, dtype=np.float64), percentiles)
+    block.update({
+        'encoder': encoder_name,
+        'input_size': int(input_size),
+        'alpha': float(alpha),
+        'feat_dim': int(np.asarray(ood_features).shape[1]),
+        'encoder_file': encoder_file,
+    })
+    return block
 
 
 def _build_novelty_block(feature_matrix, percentiles=DEFAULT_PERCENTILES):
@@ -261,6 +289,13 @@ def default_calib_path(model_path):
     return os.path.splitext(model_path)[0] + '.calib.json'
 
 
+def default_encoder_path(model_path):
+    """OOD-encoder sidecar sits next to the model:
+    <model>.novelty_encoder.h5. Saved at calibration time so a Pi driving
+    offline never needs to download the encoder's ImageNet weights."""
+    return os.path.splitext(model_path)[0] + '.novelty_encoder.h5'
+
+
 def save_calibration(calib, path):
     with open(path, 'w') as f:
         json.dump(calib, f, indent=2)
@@ -330,6 +365,25 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     logger.info(f'Replaying {len(records)} frames to collect variance '
                 f'distribution (N={num_passes}, alpha={alpha})...')
 
+    # Generic-encoder novelty (OOD) features -- the fix for the steering
+    # model's feature space being task-collapsed (see donkeycar.parts.ood).
+    # Collected on a strided subset to bound cost and batched after the loop.
+    # A failure here (e.g. no internet to fetch encoder weights) degrades
+    # gracefully: the calib simply omits the 'novelty_ood' block and live
+    # novelty reports "unavailable" rather than breaking calibration.
+    ood_name = getattr(cfg, 'XAI_NOVELTY_ENCODER', 'mobilenet_v2')
+    ood_input = getattr(cfg, 'XAI_NOVELTY_ENCODER_INPUT', None)
+    ood_alpha = getattr(cfg, 'XAI_NOVELTY_ENCODER_ALPHA', 1.0)
+    ood_extractor = None
+    try:
+        from donkeycar.parts.ood import CPUEncoderExtractor
+        ood_extractor = CPUEncoderExtractor(ood_name, ood_input, ood_alpha)
+    except Exception as e:
+        logger.warning(f'Could not build OOD encoder ({e}); novelty_ood block '
+                       f'will be skipped -- live novelty will be unavailable.')
+    ood_stride = max(1, len(records) // 3000) if ood_extractor else 1
+    ood_imgs = []
+
     smoothed = []
     dense2_features = []
     conv5_features = []
@@ -345,6 +399,9 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         dense2_features.append(np.asarray(dense2_out)[0])
         conv5_features.append(np.asarray(conv5_out)[0])
 
+        if ood_extractor is not None and i % ood_stride == 0:
+            ood_imgs.append(img)
+
         if tta_part is not None:
             # tta_part.run -> (stability, raw_var, smoothed_var)
             tta_variances.append(tta_part.run(img)[2])
@@ -359,11 +416,29 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
             tta_num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
             tta_strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2),
             tta_alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2))
+
+    ood_kwargs = {}
+    if ood_extractor is not None and ood_imgs:
+        try:
+            logger.info(f'Extracting OOD encoder features from '
+                        f'{len(ood_imgs)} frames (stride {ood_stride})...')
+            ood_features = ood_extractor.extract_batch(ood_imgs)
+            encoder_path = default_encoder_path(model_path)
+            ood_extractor.model.save(encoder_path)
+            ood_kwargs = dict(
+                ood_features=ood_features, ood_encoder=ood_extractor.name,
+                ood_input_size=ood_extractor.input_size, ood_alpha=ood_alpha,
+                ood_encoder_file=os.path.basename(encoder_path))
+            logger.info(f'Saved OOD encoder sidecar -> {encoder_path}')
+        except Exception as e:
+            logger.warning(f'OOD feature/block build failed ({e}); skipping '
+                           f'novelty_ood block.')
+
     calib = build_calibration(smoothed, num_passes, alpha,
                               percentiles=percentiles, model_path=model_path,
                               dense2_features=dense2_features,
                               conv5_features=conv5_features,
-                              **tta_kwargs)
+                              **tta_kwargs, **ood_kwargs)
     out_path = out_path or default_calib_path(model_path)
     save_calibration(calib, out_path)
     dataset.close()
@@ -387,8 +462,17 @@ def _summary(calib):
         lines.append(f"      variance {v:.6f} -> "
                      f"{variance_to_confidence(v, calib):5.1f}% confidence")
 
-    for key, label in (('novelty_global', 'global (dense_2, 50-dim)'),
-                       ('novelty_spatial', 'spatial (conv2d_5, 64-dim, pooled)')):
+    ood = calib.get('novelty_ood')
+    if ood:
+        n_active = int(np.sum(ood['active_dims']))
+        ds = ood['distance_stats']
+        lines.append(f"  novelty (LIVE) : {ood['encoder']} encoder "
+                     f"({ood['feat_dim']}-dim, input {ood['input_size']})")
+        lines.append(f"      active dims     : {n_active}/{len(ood['active_dims'])}")
+        lines.append(f"      distance min/max: {ds['min']:.1f} / {ds['max']:.1f}")
+
+    for key, label in (('novelty_global', 'legacy global (dense_2, 50-dim)'),
+                       ('novelty_spatial', 'offline spatial map (conv2d_5, pooled)')):
         block = calib.get(key)
         if not block:
             continue

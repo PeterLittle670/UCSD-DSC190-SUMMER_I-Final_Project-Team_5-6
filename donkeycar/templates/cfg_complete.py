@@ -527,14 +527,23 @@ XAI_CONFIDENCE_AUTO_CALIBRATE = False
 XAI_CONFIDENCE_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
 
 # --- Signal 2: feature-space novelty (out-of-distribution) detection -----
-# A single cheap deterministic forward pass per frame measuring how far the
-# current scene's learned features are from the training distribution
+# Measures how far the current scene is from the training distribution
 # (Mahalanobis distance) -- "have I seen anything like this?" A different
 # question from confidence above: a frame can be low-confidence yet
 # familiar-looking, or high-confidence yet genuinely novel (confidently
 # wrong). See donkeycar.parts.novelty module docstring for the full picture.
+#
+# Novelty is measured in the features of a GENERIC ImageNet encoder (below),
+# NOT the steering model's own layers -- the steering model is trained to
+# ignore scene content (grass vs track), so measuring novelty there barely
+# responded to different scenes. The encoder keeps that content. Its ImageNet
+# weights are fetched once at calibration time and saved next to the model as
+# <model>.novelty_encoder.h5, so a Pi driving offline needs no download.
 XAI_NOVELTY_ENABLED = False   # master on/off for the novelty signal
 XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
+XAI_NOVELTY_ENCODER = 'mobilenet_v2'   # generic feature encoder ('mobilenet_v2'|'mobilenet')
+XAI_NOVELTY_ENCODER_INPUT = 128        # square input size fed to the encoder
+XAI_NOVELTY_ENCODER_ALPHA = 1.0        # encoder width multiplier (smaller=faster, e.g. 0.35 on a Pi)
 # Minimum seconds between novelty updates. 0 = every frame (default). Unlike
 # confidence's interval, a held frame here costs NOTHING -- this signal never
 # drives, so between updates it just holds the last score with zero forward
