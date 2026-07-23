@@ -309,11 +309,18 @@ def load_calibration(path):
 
 def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                        alpha=None, limit=None, percentiles=DEFAULT_PERCENTILES,
-                       out_path=None):
+                       out_path=None, progress_callback=None):
     """
     Replay a tub through the MC-Dropout part, collect smoothed variances plus
     (for novelty detection) per-frame dense_2/conv2d_5 feature vectors, build
     and save a calibration file. Returns (calib_dict, out_path).
+
+    :param progress_callback: optional ``callback(stage, current, total)``,
+                              called during the per-frame replay
+                              (stage='calibrate') and around the OOD encoder's
+                              batched extraction step (stage='calibrate_ood').
+                              Used by the GUI launcher's auto-calibrate step to
+                              show progress; harmless to omit for CLI use.
     """
     # Imported here so this module is cheap to import without TF.
     from donkeycar.parts.keras import KerasLinear
@@ -408,6 +415,8 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
 
         if (i + 1) % 200 == 0:
             logger.info(f'  {i + 1}/{len(records)} frames')
+        if progress_callback:
+            progress_callback('calibrate', i + 1, len(records))
 
     tta_kwargs = {}
     if tta_enabled:
@@ -419,6 +428,8 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
 
     ood_kwargs = {}
     if ood_extractor is not None and ood_imgs:
+        if progress_callback:
+            progress_callback('calibrate_ood', 0, 1)
         try:
             logger.info(f'Extracting OOD encoder features from '
                         f'{len(ood_imgs)} frames (stride {ood_stride})...')
@@ -433,6 +444,8 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         except Exception as e:
             logger.warning(f'OOD feature/block build failed ({e}); skipping '
                            f'novelty_ood block.')
+        if progress_callback:
+            progress_callback('calibrate_ood', 1, 1)
 
     calib = build_calibration(smoothed, num_passes, alpha,
                               percentiles=percentiles, model_path=model_path,

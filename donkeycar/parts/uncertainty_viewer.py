@@ -42,6 +42,7 @@ import os
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,32 @@ class LauncherState:
 
         return {'tubs': tubs, 'models': models}
 
+    def tub_record_count(self, tub_path):
+        """
+        Best-effort total record count for a tub, read from its
+        ``manifest.json`` (a few small JSON-per-line records -- no need to
+        load the whole catalog dataset just to size the form's validation).
+        Returns None if it can't be determined (bad path, unexpected
+        manifest format).
+        """
+        manifest_path = os.path.join(
+            os.path.expanduser(tub_path), 'manifest.json')
+        if not os.path.isfile(manifest_path):
+            return None
+        try:
+            with open(manifest_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    if isinstance(d, dict) and 'current_index' in d:
+                        n_deleted = len(d.get('deleted_indexes', []))
+                        return max(0, d['current_index'] - n_deleted)
+        except Exception as e:
+            logger.debug(f'tub_record_count({tub_path}) failed: {e}')
+        return None
+
     def start(self, form):
         with self._lock:
             if self._progress['running']:
@@ -122,6 +149,27 @@ class LauncherState:
             def cb(stage, current, total):
                 self._set(stage=stage, current=current, total=total)
 
+            from donkeycar.parts.mc_calibrate import (default_calib_path,
+                                                      calibrate_from_tub)
+            calib_path = default_calib_path(os.path.expanduser(model))
+            # Auto-calibrate models that have never been calibrated, so a
+            # first-time user gets confidence/novelty %% without having to
+            # know `mc_calibrate` exists as a separate command. Opt-out via
+            # the form checkbox; a calibration failure here degrades to the
+            # pre-existing behaviour (variance-only) rather than blocking the
+            # analysis the user actually asked for.
+            if (form.get('auto_calibrate', True)
+                    and not os.path.exists(calib_path)):
+                logger.info(f'No calibration at {calib_path}; '
+                            f'auto-calibrating before analysis.')
+                try:
+                    calibrate_from_tub(self.cfg, [tub], model,
+                                       progress_callback=cb)
+                except Exception as e:
+                    logger.warning(f'Auto-calibration failed ({e}); '
+                                   f'continuing without it -- confidence/'
+                                   f'novelty %% will be unavailable.')
+
             from donkeycar.parts.gradcam_uncertainty import analyze_tub
             analyze_tub(
                 self.cfg, tub, model, out_dir,
@@ -134,6 +182,7 @@ class LauncherState:
                           and form.get('value') else None,
                 analyze_all=(mode == 'all'),
                 limit=int(form['limit']) if form.get('limit') else None,
+                start=int(form['start']) if form.get('start') else None,
                 export_frames=bool(form.get('export_frames')),
                 progress_callback=cb)
 
@@ -204,6 +253,19 @@ class ViewerHandler(SimpleHTTPRequestHandler):
                 return self._send_json({})
             return self._send_json(
                 ViewerHandler.launcher_state.progress_snapshot())
+
+        if path == '/api/tub_info':
+            if ViewerHandler.launcher_state is None:
+                return self.send_error(404)
+            tub = parse_qs(query).get('tub', [''])[0]
+            if not tub:
+                return self._send_json({'error': 'no tub given'}, status=400)
+            n = ViewerHandler.launcher_state.tub_record_count(tub)
+            if n is None:
+                return self._send_json(
+                    {'error': f'could not read manifest.json for {tub}'},
+                    status=404)
+            return self._send_json({'n_records': n})
 
         if path.startswith('/tub/'):
             if not self.tub_images_dir:

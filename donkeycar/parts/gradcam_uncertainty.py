@@ -51,7 +51,8 @@ Output (consumed by the Feature 4 viewer):
 Usage:
     python -m donkeycar.parts.gradcam_uncertainty \
         --tub data/ --model models/mypilot.h5 [--top-k 50] [--all] \
-        [--percentile 90] [--limit N] [--passes 15] [--ig-steps 32] [--out dir]
+        [--percentile 90] [--limit N] [--start N] [--passes 15] \
+        [--ig-steps 32] [--out dir]
 
 Caveats: linear model only (same scope as the live signal); the variance map
 inherits MC-Dropout's blind spots -- it measures disagreement between dropout
@@ -428,10 +429,19 @@ def _collect_tta(records, model_path, cfg, calib, progress_callback=None):
 
 def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                 top_k=50, percentile=None, analyze_all=False, limit=None,
-                export_frames=False, ig_steps=32, progress_callback=None):
+                start=None, export_frames=False, ig_steps=32,
+                progress_callback=None):
     """
     Run the full Feature 3 pipeline on one tub. Returns the data.json dict.
 
+    :param start:             skip this many records from the start of the
+                              tub before considering any frames -- combined
+                              with ``limit``, lets you scope to a specific
+                              range of the drive (e.g. ``start=1000,
+                              limit=1000`` looks at records 1000-1999).
+                              None/0 (default) starts from the first record.
+    :param limit:             only consider this many records after ``start``.
+                              None (default) considers the rest of the tub.
     :param ig_steps:          number of Riemann-sum steps for the Integrated
                               Gradients overlay (offline pixel attribution).
     :param progress_callback: optional ``callback(stage, current, total)``,
@@ -455,8 +465,10 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
 
     dataset = TubDataset(config=cfg, tub_paths=[tub_path])
     records = dataset.get_records()
-    if limit:
-        records = records[:limit]
+    if start or limit:
+        s = start or 0
+        e = (s + limit) if limit else None
+        records = records[s:e]
     if not records:
         raise ValueError(f'No records found in {tub_path}')
 
@@ -673,7 +685,13 @@ def main(args=None):
     parser.add_argument('--all', action='store_true',
                         help='analyse every frame (short drives only)')
     parser.add_argument('--limit', type=int, default=None,
-                        help='only consider the first N records')
+                        help='only consider N records (from --start, or the '
+                             'beginning of the tub)')
+    parser.add_argument('--start', type=int, default=None,
+                        help='skip this many records from the start of the '
+                             'tub before considering any frames -- combine '
+                             'with --limit for a specific range, e.g. '
+                             '--start 1000 --limit 1000 for records 1000-1999')
     parser.add_argument('--export-frames', action='store_true',
                         help='also copy every camera frame into the output '
                              'dir so playback in the viewer works without '
@@ -697,6 +715,7 @@ def main(args=None):
                        num_passes=num_passes, alpha=alpha,
                        top_k=parsed.top_k, percentile=parsed.percentile,
                        analyze_all=parsed.all, limit=parsed.limit,
+                       start=parsed.start,
                        export_frames=parsed.export_frames, ig_steps=ig_steps)
     print(f"\nGrad-CAM uncertainty analysis complete:")
     print(f"  frames in drive : {data['n_records']}")
