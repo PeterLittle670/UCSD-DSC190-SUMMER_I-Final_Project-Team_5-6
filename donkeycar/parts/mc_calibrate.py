@@ -17,6 +17,16 @@ turns that variance into a *relative, per-model* "confidence %" by:
 At drive time, ``variance_to_confidence()`` maps the live smoothed variance to
 a displayed percentage using those anchors.
 
+WHICH TUB you calibrate against matters. The whole idea is "how does this
+frame compare to the training distribution" -- so calibration should be run
+against the tub(s) the model was actually trained on, not e.g. a later
+inference/test drive (that would make "novelty" mean "unlike this other
+drive" rather than "unlike what the model learned", and would make
+"confidence %" relative to the wrong baseline entirely). ``find_training_tubs()``
+looks this up automatically from DonkeyCar's own training-run database when
+available; see its docstring and the GUI launcher's auto-calibrate feature
+(``donkeycar.parts.uncertainty_viewer``) for how this is used in practice.
+
 IMPORTANT: this is a relative, per-model calibration, NOT a formally calibrated
 Bayesian probability. A displayed "90%" means "this frame's uncertainty is low
 *relative to this model's own baseline drive*", nothing more.
@@ -282,6 +292,36 @@ def tta_variance_to_stability(variance, tta_calib_block):
     """
     anchors = tta_calib_block['stability_anchors']
     return float(np.interp(variance, anchors['variance'], anchors['stability']))
+
+
+def find_training_tubs(cfg, model_path):
+    """
+    Look up which tub(s) `model_path` was actually trained on, via
+    DonkeyCar's own ``PilotDatabase`` (``<MODELS_PATH>/database.json``,
+    written automatically by ``donkey train``). Returns a list of tub paths,
+    or None if no matching entry exists (the model wasn't trained via
+    ``donkey train``, or the database has since been moved/deleted/pruned).
+
+    This matters because calibration is supposed to establish "what does
+    normal (training) data look like" -- calibrating against some OTHER tub
+    (e.g. a post-training inference/test drive) undermines the whole point,
+    especially for novelty detection: a frame only ever looks "normal"
+    relative to whatever tub it happens to be compared against. If the
+    calibration tub isn't the training tub, "novelty" quietly becomes
+    "unlike this other drive" instead of "unlike what the model learned."
+    """
+    from donkeycar.pipeline.database import PilotDatabase
+    try:
+        db = PilotDatabase(cfg)
+    except Exception as e:
+        logger.debug(f'find_training_tubs: could not open PilotDatabase '
+                     f'({e})')
+        return None
+    name = os.path.splitext(os.path.basename(model_path))[0]
+    entry = db.get_entry(name)
+    if entry is None or not entry.get('Tubs'):
+        return None
+    return [t.strip() for t in entry['Tubs'].split(',') if t.strip()]
 
 
 def default_calib_path(model_path):

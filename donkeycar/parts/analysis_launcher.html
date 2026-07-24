@@ -57,6 +57,11 @@
     color: #cf1322; padding: 10px 12px; border-radius: 6px; font-size: 13px;
     margin-top: 10px;
   }
+  #calib-warning-box {
+    display: none; background: #fff8e6; border: 1px solid #ffe08a;
+    color: #7a5900; padding: 10px 12px; border-radius: 6px; font-size: 13px;
+    margin-top: 10px;
+  }
   datalist { display: none; }
 </style>
 </head>
@@ -104,6 +109,18 @@
       full-drive replay (only the first time you analyse this model &mdash;
       later runs reuse the saved calibration).</div>
 
+    <label for="calib-tub" id="calib-tub-label">Calibration tub (training data)</label>
+    <input type="text" id="calib-tub" list="tubs-list"
+           placeholder="auto-detected from this model's training record, if known">
+    <div class="hint" id="calib-tub-hint">Calibration must be run against the
+      tub(s) this model was actually TRAINED on &mdash; not necessarily the
+      tub above, which is often a separate inference/test drive. Calibrating
+      against the wrong data makes confidence/novelty %% meaningless (novelty
+      would end up measuring "unlike this other drive" instead of "unlike
+      what the model learned"). Auto-filled when this model's training tub
+      is on record; edit it, or leave blank and it falls back to the tub
+      above with a visible warning.</div>
+
     <div class="checkbox-row" style="margin-top: 14px;">
       <input type="checkbox" id="export-frames">
       <label for="export-frames">Export every camera frame (self-contained output, larger folder)</label>
@@ -121,8 +138,11 @@
   </div>
 
   <div class="panel" id="progress-panel">
+    <div id="calib-warning-box"></div>
     <div id="progress-text">Starting&hellip;</div>
     <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
+    <button id="continue-btn" onclick="location.href='/'"
+            style="display:none;">Continue to viewer</button>
   </div>
 </main>
 
@@ -156,6 +176,46 @@
   }
   $('tub').addEventListener('change', refreshTubInfo);
   $('tub').addEventListener('blur', refreshTubInfo);
+
+  // ---- calibration tub: auto-fill from this model's training record -------
+  // (courtesy default only -- never overwrites a value the user already
+  // typed, and the user can always clear/edit it to specify a different tub.)
+  let calibTubUserEdited = false;
+  $('calib-tub').addEventListener('input', () => { calibTubUserEdited = true; });
+
+  function refreshTrainingTubs() {
+    const model = $('model').value.trim();
+    const hint = $('calib-tub-hint');
+    const DEFAULT_HINT = 'Calibration must be run against the tub(s) this ' +
+      'model was actually TRAINED on — not necessarily the tub above, ' +
+      'which is often a separate inference/test drive. Calibrating against ' +
+      'the wrong data makes confidence/novelty % meaningless (novelty would ' +
+      'end up measuring "unlike this other drive" instead of "unlike what ' +
+      'the model learned"). Auto-filled when this model\'s training tub is ' +
+      'on record; edit it, or leave blank and it falls back to the tub ' +
+      'above with a visible warning.';
+    if (!model) { hint.textContent = DEFAULT_HINT; return; }
+    fetch('/api/training_tubs?model=' + encodeURIComponent(model))
+      .then(r => r.json())
+      .then(d => {
+        if (d.tubs && d.tubs.length) {
+          if (!calibTubUserEdited) {
+            $('calib-tub').value = d.tubs.join(', ');
+          }
+          hint.textContent = 'Auto-detected from this model\'s training ' +
+            'record: ' + d.tubs.join(', ') + '. Edit if this isn\'t right.';
+        } else {
+          hint.textContent = 'No training-tub record found for this model ' +
+            '(it may not have been trained with `donkey train`, or ' +
+            'models/database.json is missing) — type the tub(s) this model ' +
+            'was actually trained on, or leave blank to fall back to the ' +
+            'tub above (with a visible warning).';
+        }
+      })
+      .catch(() => { hint.textContent = DEFAULT_HINT; });
+  }
+  $('model').addEventListener('change', refreshTrainingTubs);
+  $('model').addEventListener('blur', refreshTrainingTubs);
 
   // Returns null (meaning: don't state a range at all) until a tub has been
   // entered AND its frame count successfully resolved -- showing a fake
@@ -283,6 +343,7 @@
       limit: rangeLimit,
       export_frames: $('export-frames').checked,
       auto_calibrate: $('auto-calibrate').checked,
+      calib_tub: $('calib-tub').value.trim(),
     };
 
     $('run-btn').disabled = true;
@@ -317,6 +378,14 @@
         showError(p.error);
         return;
       }
+      // Show as soon as it appears (mid-run), not only once everything is
+      // done -- this is a correctness caveat, not a transient status.
+      if (p.calibration_warning) {
+        const box = $('calib-warning-box');
+        box.textContent = '⚠ ' + p.calibration_warning;
+        box.style.display = 'block';
+      }
+
       const label = STAGE_LABEL[p.stage] || p.stage || 'Working…';
       const pct = p.total ? Math.round(100 * p.current / p.total) : 2;
       $('progress-text').textContent =
@@ -325,9 +394,16 @@
 
       if (p.done) {
         if (p.out_dir) {
-          $('progress-text').textContent = 'Done! Opening viewer…';
           $('progress-bar').style.width = '100%';
-          setTimeout(() => { window.location.href = '/'; }, 600);
+          if (p.calibration_warning) {
+            // Don't whisk the user away before they've read the warning --
+            // require an explicit click through instead of auto-redirecting.
+            $('progress-text').textContent = 'Done (see warning above).';
+            $('continue-btn').style.display = 'inline-block';
+          } else {
+            $('progress-text').textContent = 'Done! Opening viewer…';
+            setTimeout(() => { window.location.href = '/'; }, 600);
+          }
         }
         return;
       }

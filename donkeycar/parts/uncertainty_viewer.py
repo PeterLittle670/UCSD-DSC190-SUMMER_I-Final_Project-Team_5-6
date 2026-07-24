@@ -65,7 +65,7 @@ class LauncherState:
         self._lock = threading.Lock()
         self._progress = {'running': False, 'done': False, 'error': None,
                           'stage': None, 'current': 0, 'total': 0,
-                          'out_dir': None}
+                          'out_dir': None, 'calibration_warning': None}
 
     def progress_snapshot(self):
         with self._lock:
@@ -126,13 +126,24 @@ class LauncherState:
             logger.debug(f'tub_record_count({tub_path}) failed: {e}')
         return None
 
+    def training_tubs_for_model(self, model_path):
+        """Best-effort lookup of the tub(s) `model_path` was actually trained
+        on (see ``mc_calibrate.find_training_tubs``), for pre-filling the
+        form's "Calibration tub" field. Returns None if unknown."""
+        try:
+            from donkeycar.parts.mc_calibrate import find_training_tubs
+            return find_training_tubs(self.cfg, os.path.expanduser(model_path))
+        except Exception as e:
+            logger.debug(f'training_tubs_for_model({model_path}) failed: {e}')
+            return None
+
     def start(self, form):
         with self._lock:
             if self._progress['running']:
                 raise RuntimeError('An analysis is already running.')
             self._progress = {'running': True, 'done': False, 'error': None,
                               'stage': 'starting', 'current': 0, 'total': 0,
-                              'out_dir': None}
+                              'out_dir': None, 'calibration_warning': None}
         thread = threading.Thread(target=self._run, args=(form,), daemon=True)
         thread.start()
 
@@ -150,7 +161,8 @@ class LauncherState:
                 self._set(stage=stage, current=current, total=total)
 
             from donkeycar.parts.mc_calibrate import (default_calib_path,
-                                                      calibrate_from_tub)
+                                                      calibrate_from_tub,
+                                                      find_training_tubs)
             calib_path = default_calib_path(os.path.expanduser(model))
             # Auto-calibrate models that have never been calibrated, so a
             # first-time user gets confidence/novelty %% without having to
@@ -158,17 +170,61 @@ class LauncherState:
             # the form checkbox; a calibration failure here degrades to the
             # pre-existing behaviour (variance-only) rather than blocking the
             # analysis the user actually asked for.
+            #
+            # IMPORTANT: calibration establishes "what does normal (training)
+            # data look like" -- it must run against the tub(s) the model was
+            # actually TRAINED on, not necessarily the tub being analysed here
+            # (which is very often a separate inference/test drive). Using the
+            # analysis tub as the calibration baseline would make novelty mean
+            # "unlike this other drive" instead of "unlike what the model
+            # learned" -- silently defeating the point of the signal. Priority
+            # order: (1) a tub the user explicitly typed into the "Calibration
+            # tub" field, (2) the real training tub(s) looked up from
+            # DonkeyCar's own training database, (3) the analysis tub as a
+            # last resort -- with a visible warning, not just a log line, for
+            # (3) since it's the one case that's likely wrong.
             if (form.get('auto_calibrate', True)
                     and not os.path.exists(calib_path)):
-                logger.info(f'No calibration at {calib_path}; '
-                            f'auto-calibrating before analysis.')
+                calib_tub_override = (form.get('calib_tub') or '').strip()
+                if calib_tub_override:
+                    calib_tubs = [t.strip() for t in
+                                 calib_tub_override.split(',') if t.strip()]
+                    logger.info(f'No calibration at {calib_path}; '
+                                f'auto-calibrating against the user-specified '
+                                f'tub(s): {calib_tubs}')
+                else:
+                    training_tubs = find_training_tubs(self.cfg, model)
+                    if training_tubs:
+                        calib_tubs = training_tubs
+                        logger.info(f'No calibration at {calib_path}; '
+                                    f'auto-calibrating against this model\'s '
+                                    f'recorded training tub(s): {calib_tubs}')
+                    else:
+                        calib_tubs = [tub]
+                        warning = (
+                            f'Could not find this model\'s recorded training '
+                            f'tub (no models/database.json entry, and no '
+                            f'"Calibration tub" was specified), so '
+                            f'calibration used the ANALYSIS tub ({tub}) '
+                            f'instead. If that is not the tub this model was '
+                            f'actually trained on, confidence/novelty %% here '
+                            f'are calibrated against the wrong baseline -- '
+                            f'specify the real training tub and recalibrate '
+                            f'for meaningful numbers.')
+                        logger.warning(warning)
+                        self._set(calibration_warning=warning)
                 try:
-                    calibrate_from_tub(self.cfg, [tub], model,
+                    calibrate_from_tub(self.cfg, calib_tubs, model,
                                        progress_callback=cb)
                 except Exception as e:
-                    logger.warning(f'Auto-calibration failed ({e}); '
-                                   f'continuing without it -- confidence/'
-                                   f'novelty %% will be unavailable.')
+                    # Surfaced to the UI (not just logged) -- a bad tub path
+                    # here was previously silently swallowed, leaving the user
+                    # with no calibration and no idea why.
+                    msg = (f'Auto-calibration against {calib_tubs} failed: '
+                          f'{e}. Continuing without it -- confidence/'
+                          f'novelty %% will be unavailable.')
+                    logger.warning(msg)
+                    self._set(calibration_warning=msg)
 
             from donkeycar.parts.gradcam_uncertainty import analyze_tub
             analyze_tub(
@@ -266,6 +322,15 @@ class ViewerHandler(SimpleHTTPRequestHandler):
                     {'error': f'could not read manifest.json for {tub}'},
                     status=404)
             return self._send_json({'n_records': n})
+
+        if path == '/api/training_tubs':
+            if ViewerHandler.launcher_state is None:
+                return self.send_error(404)
+            model = parse_qs(query).get('model', [''])[0]
+            if not model:
+                return self._send_json({'error': 'no model given'}, status=400)
+            tubs = ViewerHandler.launcher_state.training_tubs_for_model(model)
+            return self._send_json({'tubs': tubs})
 
         if path.startswith('/tub/'):
             if not self.tub_images_dir:
