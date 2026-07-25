@@ -606,6 +606,39 @@ AUG_NOISE_PROBABILITY = 0.3
 # moderate so lane markings stay visible.
 AUG_NOISE_STD_RANGE = (0.05, 0.15)
 
+# Local sunlight augmentation. Unlike BRIGHTNESS/GAMMA, which scale the
+# *whole* image, this brightens one or more randomly shaped, randomly
+# placed regions (a blob, a rotated/elongated patch, or a directional band
+# crossing the frame), while the rest of the image is left unchanged. This
+# simulates the mixed lighting seen around midday, where part of the track
+# is in harsh direct sun and part is shaded, often with a sharp boundary
+# between them - something a uniform brightness/gamma shift can't
+# reproduce. Enable it by adding 'SUNLIGHT' to the AUGMENTATIONS list
+# above; like all augmentations this only ever runs during training and
+# has no effect during inference. Excessive strength/coverage can wash out
+# the lane in every sample, so start with the defaults below and increase
+# gradually.
+#
+# Probability that a given training image receives local sunlight (0..1).
+AUG_SUNLIGHT_PROBABILITY = 0.3
+# Min/max lightness multiplier applied inside the sunlit region. 1.0 = no
+# change; e.g. 1.8 = up to 80% brighter at full strength before clipping.
+AUG_SUNLIGHT_STRENGTH_RANGE = (1.15, 1.8)
+# Min/max fraction of the image area the sunlit region(s) should cover
+# (approximately - actual coverage depends on shape and overlap).
+AUG_SUNLIGHT_COVERAGE_RANGE = (0.15, 0.55)
+# Min/max number of separate sunlit regions per image. Keep this small;
+# too many bright patches looks unrealistic.
+AUG_SUNLIGHT_REGION_COUNT_RANGE = (1, 2)
+# Min/max Gaussian blur kernel size used to soften the sunlight edge, so
+# the transition ranges from a soft glow to a near-hard boundary (real
+# sun/shade edges vary). A kernel of 1 leaves that region's edge sharp.
+AUG_SUNLIGHT_BLUR_KERNEL_RANGE = (11, 41)
+# Fraction of image height above which sunlit regions are mostly excluded,
+# so the effect is concentrated on the road rather than the sky. Defaults
+# to the bottom 75% of the image.
+AUG_SUNLIGHT_ROAD_REGION_START = 0.25
+
 
 # ------------------------------------------------------------------------------
 # TRANSFORMATIONS (Applied during Training AND Inference)
@@ -620,6 +653,7 @@ AUG_NOISE_STD_RANGE = (0.05, 0.15)
 #   - SHADOW      - add random partial shadows to simulate changing sunlight
 #   - GAMMA       - nonlinear brightening/darkening, simulates glare and low light
 #   - NOISE       - add sensor grain/noise, simulates low-light camera footage
+#   - SUNLIGHT    - add one or more localized bright regions, simulates mixed sun/shade at midday
 #
 # Example AUGMENTATIONS profiles - copy the list (and any of the AUG_*
 # overrides mentioned) into your myconfig.py. These are starting points,
@@ -627,12 +661,23 @@ AUG_NOISE_STD_RANGE = (0.05, 0.15)
 #   - indoor:          ['BRIGHTNESS', 'GAMMA']
 #   - outdoor:         ['BRIGHTNESS', 'SHADOW', 'BLUR']
 #   - low_light:       ['GAMMA', 'NOISE', 'SHADOW']
+#   - noon:            ['SUNLIGHT', 'SHADOW', 'GAMMA', 'BRIGHTNESS', 'NOISE', 'BLUR']
+#     For driving around midday, where the track has sharp sun/shade
+#     boundaries. Order matters: local lighting effects (SUNLIGHT, SHADOW)
+#     are applied to clean pixels first, then global tone adjustments
+#     (GAMMA, BRIGHTNESS), then sensor-level NOISE, then BLUR last to
+#     simulate optical softening of the final image. SUNLIGHT and SHADOW
+#     each have their own independent probability
+#     (AUG_SUNLIGHT_PROBABILITY / AUG_SHADOW_PROBABILITY), so most images
+#     get at most one of the two rather than both stacked together.
 #   - all_conditions:  ['BRIGHTNESS', 'BLUR', 'SHADOW', 'GAMMA', 'NOISE']
 #     Recommended starting point when training a single model on combined
 #     day/midday/night data, since it covers exposure variation, partial
 #     shadows, nonlinear day<->night lighting changes, and low-light
 #     sensor grain together. Consider widening AUG_GAMMA_RANGE (e.g. to
 #     (60, 160)) so it covers stronger night darkening and midday glare.
+#     Add 'SUNLIGHT' too (see the 'noon' profile above) if midday mixed
+#     lighting is part of your training data.
 #
 # - Transformations are changes to the image that apply both in
 #   training and at inference.  They are always applied and in

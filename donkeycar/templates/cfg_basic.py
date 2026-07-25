@@ -131,6 +131,15 @@ AUG_GAMMA_PROBABILITY = 0.5
 AUG_NOISE_STD_RANGE = (0.05, 0.15)
 AUG_NOISE_MEAN_RANGE = (0.0, 0.0)
 AUG_NOISE_PROBABILITY = 0.3
+# Settings for local sunlight (simulates midday mixed sun/shade, unlike
+# BRIGHTNESS which changes the whole image uniformly), use 'SUNLIGHT' in
+# AUGMENTATIONS. See cfg_complete.py for a full explanation of each setting.
+AUG_SUNLIGHT_PROBABILITY = 0.3
+AUG_SUNLIGHT_STRENGTH_RANGE = (1.15, 1.8)
+AUG_SUNLIGHT_COVERAGE_RANGE = (0.15, 0.55)
+AUG_SUNLIGHT_REGION_COUNT_RANGE = (1, 2)
+AUG_SUNLIGHT_BLUR_KERNEL_RANGE = (11, 41)
+AUG_SUNLIGHT_ROAD_REGION_START = 0.25
 # Number of pixels to crop, requires 'CROP' in TRANSFORMATIONS to be set
 ROI_CROP_TOP = 45
 ROI_CROP_BOTTOM = 0
