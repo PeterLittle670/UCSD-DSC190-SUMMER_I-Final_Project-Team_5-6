@@ -412,6 +412,13 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                   inputs=['cam/image_array'], outputs=['cam/image_array_trans'])
             inputs = ['cam/image_array_trans'] + inputs[1:]
 
+        # Enabled-but-uncalibrated XAI signals, collected below and pushed to
+        # the dashboard once (see the end of this block) -- so someone
+        # actually driving sees why a panel never shows a %%, instead of that
+        # only ever appearing as a server log line nobody watching the
+        # dashboard would see.
+        xai_uncalibrated = []
+
         #
         # MC-Dropout confidence signal: runs the model N times per frame with
         # dropout active and emits the variance of the steering predictions
@@ -435,6 +442,12 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                 logger.warning(f"No calibration found at {calib_path}; run "
                                f"'python -m donkeycar.parts.mc_calibrate' to "
                                f"enable the confidence %. Variance still logged.")
+                xai_uncalibrated.append({
+                    'signal': 'confidence', 'label': 'Confidence',
+                    'message': f"Enabled, but {os.path.basename(calib_path)} "
+                               f"doesn't exist yet, so this won't show a %. "
+                               f"Run: python -m donkeycar.parts.mc_calibrate "
+                               f"--tub <training tub> --model {model_path}"})
                 calib_path = None
             logger.info(f"Enabling MC-Dropout confidence (N={n_passes}, "
                         f"alpha={alpha})")
@@ -467,6 +480,13 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                 logger.warning(f"No calibration found at {novelty_calib_path}; "
                                f"run 'python -m donkeycar.parts.mc_calibrate' "
                                f"to enable novelty detection.")
+                xai_uncalibrated.append({
+                    'signal': 'novelty', 'label': 'Novelty',
+                    'message': f"Enabled, but "
+                               f"{os.path.basename(novelty_calib_path)} "
+                               f"doesn't exist yet, so this won't show a %. "
+                               f"Run: python -m donkeycar.parts.mc_calibrate "
+                               f"--tub <training tub> --model {model_path}"})
                 novelty_calib_path = None
             logger.info("Enabling feature-space novelty detection")
             novelty_part = FeatureNoveltyDetector(
@@ -492,9 +512,17 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
             from donkeycar.parts.mc_calibrate import default_calib_path
             tta_calib_path = default_calib_path(model_path)
             if not os.path.exists(tta_calib_path):
-                logger.warning(f"No calibration found at {tta_calib_path}; run "
-                               f"'python -m donkeycar.parts.mc_calibrate' with "
-                               f"XAI_TTA_ENABLED=True to enable the stability %.")
+                logger.warning(f"No calibration found at {tta_calib_path}; "
+                               f"with XAI_TTA_ENABLED already on, run "
+                               f"'python -m donkeycar.parts.mc_calibrate' to "
+                               f"add the TTA stability %.")
+                xai_uncalibrated.append({
+                    'signal': 'tta', 'label': 'TTA stability',
+                    'message': f"Enabled, but "
+                               f"{os.path.basename(tta_calib_path)} doesn't "
+                               f"exist yet, so this won't show a %. Run: "
+                               f"python -m donkeycar.parts.mc_calibrate "
+                               f"--tub <training tub> --model {model_path}"})
                 tta_calib_path = None
             logger.info("Enabling test-time augmentation (TTA) stability")
             tta_part = TTAStabilityDetector(
@@ -507,6 +535,16 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                   outputs=['pilot/tta_stability', 'pilot/raw_tta_variance',
                            'pilot/smoothed_tta_variance'],
                   run_condition='run_pilot')
+
+        # Push the calibration gaps found above to the dashboard (once per
+        # new connection -- see WebSocketDriveAPI.open in web.py). Read from
+        # V.web_ctr (set in add_user_controller), NOT a local `ctr` variable,
+        # since `ctr` gets reassigned to a joystick/RC controller when one is
+        # configured -- the web dashboard still runs in that case (just isn't
+        # the primary input), and should still get the banner.
+        web_ctr = getattr(V, 'web_ctr', None)
+        if xai_uncalibrated and web_ctr is not None:
+            web_ctr.xai_uncalibrated = xai_uncalibrated
 
         #
         # Feature 2: scale throttle down as confidence drops, novelty rises,
@@ -843,6 +881,13 @@ def add_user_controller(V, cfg, use_joystick, input_image='ui/image_array'):
                   'pilot/confidence', 'pilot/novelty', 'pilot/tta_stability'],
           outputs=['user/steering', 'user/throttle', 'user/mode', 'recording', 'web/buttons'],
           threaded=True)
+    # Keep a reference to the web controller specifically, on the vehicle
+    # itself rather than this function's local `ctr` -- `ctr` gets
+    # REASSIGNED below to a joystick/RC controller when one is configured
+    # (a common setup: joystick to drive, web dashboard just to monitor), so
+    # code elsewhere that needs the actual web controller (e.g. to push the
+    # XAI "not calibrated" dashboard banner) must not rely on `ctr` itself.
+    V.web_ctr = ctr
 
     #
     # also add a physical controller if one is configured

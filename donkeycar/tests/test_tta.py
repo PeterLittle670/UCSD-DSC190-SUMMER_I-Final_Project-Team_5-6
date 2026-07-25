@@ -85,6 +85,28 @@ class TestTTAStabilityDetector(unittest.TestCase):
         self.assertIsNone(stability)
         self.assertEqual(raw_var, 0.0)
 
+    def test_uncalibrated_skips_the_forward_pass_entirely(self):
+        # Without a calibration block there's nothing to score against, so
+        # the M-pass batch should never actually run (mirrors
+        # FeatureNoveltyDetector) -- important on a Pi, where this would
+        # otherwise burn M forward passes every frame for a number nobody
+        # can read.
+        part = TTAStabilityDetector(self.pilot, num_samples=8, seed=0)
+        self.assertIsNone(part.calibration)
+        calls = {'n': 0}
+        real_model = part.model
+
+        def counting_call(*a, **kw):
+            calls['n'] += 1
+            return real_model(*a, **kw)
+
+        part.model = counting_call
+        stability, raw_var, smoothed_var = part.run(self.img)
+        self.assertEqual(calls['n'], 0)
+        self.assertIsNone(stability)
+        self.assertEqual(raw_var, 0.0)
+        self.assertEqual(smoothed_var, 0.0)
+
     def test_stability_uses_calibration_block_when_present(self):
         part = TTAStabilityDetector(self.pilot, num_samples=8, seed=0)
         # Attach a real tta block built from a synthetic variance distribution.
@@ -114,6 +136,12 @@ class TestTTAStabilityDetectorInterval(unittest.TestCase):
     def _counting_part(self, interval):
         part = TTAStabilityDetector(self.pilot, num_samples=4,
                                     interval=interval, seed=0)
+        # The interval-skip logic and the uncalibrated-skip logic are
+        # independent gates on the same forward pass -- attach a minimal
+        # calibration block so these tests exercise the interval gate alone.
+        part.calibration = {
+            'stability_anchors': {'variance': [0.0, 1.0], 'stability': [99.0, 5.0]},
+        }
         calls = {'n': 0}
         real_model = part.model
 

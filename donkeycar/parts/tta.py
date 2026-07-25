@@ -103,7 +103,11 @@ class TTAStabilityDetector:
     expensive per-update than novelty's single pass, so rate-limiting via
     ``interval`` matters more here on slow/power-constrained hardware. Between
     updates the last score is held and NO forward pass runs at all (no
-    fallback pass needed, since this part never drives).
+    fallback pass needed, since this part never drives). Likewise, if the
+    model has no calibration at all (``calibration_path`` missing/invalid),
+    the M-pass batch is skipped entirely rather than computed and discarded --
+    nothing consumes the raw variance without a calibration mapping, so there
+    is no reason to pay for it.
 
     Run signature::
 
@@ -186,14 +190,22 @@ class TTAStabilityDetector:
                 (self.smoothed_variance or 0.0)
         self.last_update_time = now
 
-        norm = normalize_image(img_arr).astype(np.float32)
-        batch = photometric_batch(norm, self.num_samples, self.strength,
-                                  self.rng)
-        input_dict = {self.input_keys[0]: tf.convert_to_tensor(batch)}
-        outputs = self.model(input_dict, training=False)   # DETERMINISTIC
-        # Linear model returns [angle (M,1), throttle (M,1)].
-        angle_samples = np.asarray(outputs[0]).reshape(-1)
-        raw_variance = float(np.var(angle_samples))
+        if self.calibration is not None:
+            norm = normalize_image(img_arr).astype(np.float32)
+            batch = photometric_batch(norm, self.num_samples, self.strength,
+                                      self.rng)
+            input_dict = {self.input_keys[0]: tf.convert_to_tensor(batch)}
+            outputs = self.model(input_dict, training=False)  # DETERMINISTIC
+            # Linear model returns [angle (M,1), throttle (M,1)].
+            angle_samples = np.asarray(outputs[0]).reshape(-1)
+            raw_variance = float(np.var(angle_samples))
+        else:
+            # No calibration to score against -- skip the M-pass batch
+            # entirely (mirrors FeatureNoveltyDetector). Nothing else
+            # consumes the raw variance without a calibration mapping, so
+            # there's no reason to pay for M forward passes just to produce
+            # a number nobody reads.
+            raw_variance = 0.0
         self.raw_variance = raw_variance
 
         if self.smoothed_variance is None:

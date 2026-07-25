@@ -1,6 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <!-- Shown once per dashboard connection when an enabled XAI signal (confidence/
+       novelty/TTA) has no calibration yet, so the person actually driving sees
+       why a panel never appears -- not just a line in a server log. -->
+  <div id="xai-uncalibrated-banner" class="xai-banner" style="display: none;">
+    <button type="button" id="xai-banner-dismiss" class="xai-banner-dismiss" aria-label="Dismiss">&times;</button>
+    <strong>Not calibrated:</strong> the following won't show a percentage until calibrated.
+    <ul id="xai-banner-list"></ul>
+  </div>
   <div class="container">
     <div class="row">
 

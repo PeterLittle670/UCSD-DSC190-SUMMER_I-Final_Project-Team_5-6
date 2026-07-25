@@ -127,6 +127,14 @@ class LocalWebController(tornado.web.Application):
         self.last_novelty_pct = None       # last value pushed to clients
         self.tta_stability = None          # last TTA stability % (or None)
         self.last_tta_pct = None           # last value pushed to clients
+        # XAI signals that are enabled but have no calibration -- set once by
+        # the drive template (complete.py) before the server starts, since it
+        # already knows this at vehicle-build time. Pushed to each new
+        # dashboard connection (see WebSocketDriveAPI.open below) so the
+        # person actually driving sees it, instead of only a server log line
+        # nobody watching the dashboard would ever see.
+        # [{'signal': 'confidence', 'label': 'Confidence', 'message': '...'}]
+        self.xai_uncalibrated = []
         self.wsclients = []
         self.loop = None
 
@@ -323,6 +331,12 @@ class WebSocketDriveAPI(tornado.websocket.WebSocketHandler):
     def open(self):
         logger.info("New client connected")
         self.application.wsclients.append(self)
+        # One-time push (not part of the per-frame telemetry loop) so a
+        # dashboard user sees, at a glance, which enabled XAI signals won't
+        # show a %% because this model has never been calibrated.
+        if self.application.xai_uncalibrated:
+            self.write_message(json.dumps(
+                {'xai_uncalibrated': self.application.xai_uncalibrated}))
 
     def on_message(self, message):
         data = json.loads(message)

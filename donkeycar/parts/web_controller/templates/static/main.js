@@ -110,6 +110,18 @@ var driveHandler = new function() {
         return changed;
     }
 
+    // Renders the one-time "not calibrated" dashboard banner. `items` is a
+    // list of {signal, label, message} -- see LocalWebController.xai_uncalibrated
+    // (web.py) / complete.py, where this is built at vehicle start.
+    var showXaiUncalibratedBanner = function(items) {
+        var $list = $('#xai-banner-list');
+        $list.empty();
+        items.forEach(function(item) {
+            $list.append($('<li>').append($('<strong>').text(item.label + ': ')).append(document.createTextNode(item.message)));
+        });
+        $('#xai-uncalibrated-banner').show();
+    }
+
     var setBindings = function() {
       //
       // when server sends a message with state changes
@@ -119,6 +131,12 @@ var driveHandler = new function() {
       socket.onmessage = function (event) {
         console.log(event.data);
         const data = JSON.parse(event.data);
+        // One-time push on connect (not part of the per-frame telemetry
+        // updateState/updateUI loop below) -- handled separately since
+        // updateState only ever updates keys the state object already has.
+        if (data.xai_uncalibrated) {
+            showXaiUncalibratedBanner(data.xai_uncalibrated);
+        }
         if(updateState(state, data)) {
             updateUI();
         }
@@ -155,6 +173,10 @@ var driveHandler = new function() {
 
       $('#brake_button').click(function() {
         toggleBrake();
+      });
+
+      $('#xai-banner-dismiss').click(function() {
+        $('#xai-uncalibrated-banner').hide();
       });
 
       // Plain-language "what does this mean?" toggles on the confidence/
