@@ -526,6 +526,35 @@ XAI_CONFIDENCE_INTERVAL = 0.0
 XAI_CONFIDENCE_AUTO_CALIBRATE = False
 XAI_CONFIDENCE_CALIBRATE_LIMIT = None   # cap frames used for calibration (None=all)
 
+# --- Augmentation-aware novelty calibration ------------------------------
+# Training applies AUGMENTATIONS (see the augmentation section further down)
+# only to the training split, so a novelty baseline fit on raw tub frames
+# describes a NARROWER input distribution than the model was actually
+# trained for. The consequence: an ordinary shadowed or dim frame scores as
+# highly novel at runtime, and with XAI_THROTTLE_SCALING_ENABLED the car
+# slows down in exactly the conditions augmentation was added to survive.
+#
+# Measured on a 9221-frame tub with AUGMENTATIONS = ['SHADOW','GAMMA','NOISE']
+# and a clean-only baseline: augmented-but-normal frames crossed the default
+# XAI_NOVELTY_REDUCED_THRESHOLD 79% of the time (vs 38% for clean frames) and
+# the CRITICAL threshold 50% of the time (vs 10%).
+#
+# Unlike the confidence/TTA percentiles -- which are re-measured through the
+# retrained model on every calibration and so rescale themselves -- this
+# cannot self-correct: live novelty measures distance in a FROZEN ImageNet
+# encoder's feature space, which never sees a training epoch.
+#
+# When True (default) and AUGMENTATIONS is non-empty, calibration also pushes
+# a strided subset of frames through the same augmentation pipeline used in
+# training and pools those features into the novelty baseline. With no
+# AUGMENTATIONS configured this does nothing, so un-augmented models
+# calibrate exactly as before. Scoped to the novelty baselines only: the
+# MC-Dropout and TTA replays are untouched (their EMAs assume a contiguous
+# time-ordered frame stream).
+XAI_CALIBRATE_WITH_AUGMENTATIONS = True
+XAI_CALIBRATE_AUG_PASSES = 2        # randomised augmented passes per sampled frame
+XAI_CALIBRATE_AUG_MAX_SAMPLES = 1500  # cap on total augmented samples (bounds RAM/time)
+
 # --- Signal 2: feature-space novelty (out-of-distribution) detection -----
 # Measures how far the current scene is from the training distribution
 # (Mahalanobis distance) -- "have I seen anything like this?" A different

@@ -75,6 +75,11 @@ _ANCHOR_NOVELTY = {
     'max': 98.0,
 }
 
+# Frames per OOD-encoder forward batch. The extractor resizes and converts the
+# whole list it is handed into one float32 array, so an unchunked call over a
+# large tub allocates far more than the uint8 frames themselves.
+_OOD_CHUNK = 256
+
 
 def build_calibration(smoothed_variances, num_passes, alpha,
                       percentiles=DEFAULT_PERCENTILES, model_path=None,
@@ -82,7 +87,8 @@ def build_calibration(smoothed_variances, num_passes, alpha,
                       tta_variances=None, tta_num_samples=None,
                       tta_strength=None, tta_alpha=None,
                       ood_features=None, ood_encoder=None, ood_input_size=None,
-                      ood_alpha=1.0, ood_encoder_file=None):
+                      ood_alpha=1.0, ood_encoder_file=None,
+                      augmentation_info=None):
     """
     Turn a collected distribution of smoothed variances into a calibration
     dict (JSON-serialisable). Optionally also fits novelty-detection
@@ -100,6 +106,13 @@ def build_calibration(smoothed_variances, num_passes, alpha,
     :param tta_variances:   optional list of per-frame test-time-augmentation
                             steering variances -- fits the ``tta`` stability
                             calibration block (see donkeycar.parts.tta).
+    :param augmentation_info: optional provenance dict recording whether the
+                            novelty baselines were widened with training-style
+                            augmented frames (see ``calibrate_from_tub``).
+                            Stored as-is under the ``augmentation`` key so a
+                            calibration can be told apart from a clean-only
+                            one after the fact; omitted when None, keeping
+                            older calibration files valid.
     """
     v = np.asarray(smoothed_variances, dtype=np.float64)
     v = v[np.isfinite(v)]
@@ -152,6 +165,8 @@ def build_calibration(smoothed_variances, num_passes, alpha,
         calib['novelty_ood'] = _build_ood_block(
             ood_features, ood_encoder, ood_input_size, ood_alpha,
             ood_encoder_file, percentiles)
+    if augmentation_info is not None:
+        calib['augmentation'] = augmentation_info
 
     return calib
 
@@ -349,7 +364,7 @@ def load_calibration(path):
 
 def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                        alpha=None, limit=None, percentiles=DEFAULT_PERCENTILES,
-                       out_path=None, progress_callback=None):
+                       out_path=None, progress_callback=None, augment=None):
     """
     Replay a tub through the MC-Dropout part, collect smoothed variances plus
     (for novelty detection) per-frame dense_2/conv2d_5 feature vectors, build
@@ -361,6 +376,45 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                               batched extraction step (stage='calibrate_ood').
                               Used by the GUI launcher's auto-calibrate step to
                               show progress; harmless to omit for CLI use.
+    :param augment:           whether to widen the *novelty* baselines with
+                              training-style augmented frames (see below).
+                              ``None`` (default) reads
+                              ``XAI_CALIBRATE_WITH_AUGMENTATIONS`` from cfg.
+
+    AUGMENTATION-AWARE NOVELTY BASELINES
+    ------------------------------------
+    Novelty is a distance-from-training-distribution measure, so its baseline
+    has to describe the inputs the model was actually *trained* on. Training
+    applies ``cfg.AUGMENTATIONS`` (shadow / gamma / noise / brightness / blur)
+    only inside ``BatchSequence.image_processor`` when ``is_train=True``, so a
+    baseline fit on raw tub frames alone describes a *narrower* input
+    distribution than the model was trained for. A perfectly ordinary
+    shadowed or dim frame then scores as highly novel at runtime and -- with
+    ``XAI_THROTTLE_SCALING_ENABLED`` -- needlessly throttles the car down in
+    exactly the conditions augmentation was added to survive.
+
+    Unlike the confidence/TTA percentiles (which are re-collected through the
+    retrained model every time and so rescale themselves), the novelty
+    baseline cannot self-correct: the live signal measures distance in a
+    *frozen* ImageNet encoder's feature space (see ``donkeycar.parts.ood``),
+    which never sees a training epoch. So it is fixed here instead.
+
+    When ``cfg.AUGMENTATIONS`` is non-empty, a strided subset of frames is
+    additionally passed through the same ``ImageAugmentation`` pipeline used
+    in training, ``XAI_CALIBRATE_AUG_PASSES`` times each (re-randomised per
+    pass, since each ``run()`` samples fresh parameters), and those feature
+    vectors are pooled with the clean ones before fitting. The resulting
+    Gaussian covers the training-time input envelope rather than just its
+    clean centre.
+
+    Deliberately scoped to the novelty statistics only:
+
+      * The MC-Dropout variance and TTA replays are left untouched. Both parts
+        carry an EMA over a *time-ordered* frame sequence; splicing augmented
+        frames into that stream would corrupt the smoothing. Their outputs are
+        therefore bit-for-bit identical to before this option existed.
+      * With no ``AUGMENTATIONS`` configured the augmenter is skipped
+        entirely, so calibrations for un-augmented models are also unchanged.
     """
     # Imported here so this module is cheap to import without TF.
     from donkeycar.parts.keras import KerasLinear
@@ -431,6 +485,38 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     ood_stride = max(1, len(records) // 3000) if ood_extractor else 1
     ood_imgs = []
 
+    # Augmentation-aware novelty baseline (see the docstring). Self-gating:
+    # an empty AUGMENTATIONS list means no augmenter and no behaviour change.
+    aug_list = getattr(cfg, 'AUGMENTATIONS', None) or []
+    if augment is None:
+        augment = getattr(cfg, 'XAI_CALIBRATE_WITH_AUGMENTATIONS', True)
+    aug_passes = int(getattr(cfg, 'XAI_CALIBRATE_AUG_PASSES', 2))
+    augmenter = None
+    if augment and aug_list and aug_passes > 0:
+        try:
+            from donkeycar.pipeline.augmentations import ImageAugmentation
+            augmenter = ImageAugmentation(cfg, 'AUGMENTATIONS')
+        except Exception as e:
+            logger.warning(f'Could not build the training augmentation '
+                           f'pipeline ({e}); novelty baselines will be fit on '
+                           f'clean frames only, which can read as falsely '
+                           f'novel under shadow/low light.')
+    # Strided so the extra samples stay bounded regardless of tub size: a
+    # diagonal Gaussian only needs enough samples per dimension, not one per
+    # frame. Clean frames still outnumber augmented ones, which matches
+    # training (augmentations apply with probability p, not always).
+    aug_max_samples = int(getattr(cfg, 'XAI_CALIBRATE_AUG_MAX_SAMPLES', 1500))
+    aug_stride = 1
+    if augmenter is not None:
+        aug_stride = max(1, (len(records) * aug_passes) //
+                         max(1, aug_max_samples))
+        logger.info(f'Novelty baselines will also include augmented frames '
+                    f'({aug_list}, {aug_passes} pass(es), every '
+                    f'{aug_stride} frame(s)) so shadow/low-light conditions '
+                    f'the model was trained for do not read as novel.')
+    aug_ood_imgs = []
+    n_aug_samples = 0
+
     smoothed = []
     dense2_features = []
     conv5_features = []
@@ -448,6 +534,20 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
 
         if ood_extractor is not None and i % ood_stride == 0:
             ood_imgs.append(img)
+
+        # Extra novelty samples only -- deliberately NOT fed to part.run /
+        # tta_part.run, whose EMAs assume a contiguous time-ordered stream.
+        if augmenter is not None and i % aug_stride == 0:
+            for _ in range(aug_passes):
+                aug_img = augmenter.run(img)
+                aug_norm = normalize_image(aug_img).astype(np.float32)
+                aug_d2, aug_c5 = feat_model(aug_norm[np.newaxis, ...],
+                                            training=False)
+                dense2_features.append(np.asarray(aug_d2)[0])
+                conv5_features.append(np.asarray(aug_c5)[0])
+                if ood_extractor is not None:
+                    aug_ood_imgs.append(aug_img)
+                n_aug_samples += 1
 
         if tta_part is not None:
             # tta_part.run -> (stability, raw_var, smoothed_var)
@@ -471,9 +571,18 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         if progress_callback:
             progress_callback('calibrate_ood', 0, 1)
         try:
+            all_ood_imgs = ood_imgs + aug_ood_imgs
             logger.info(f'Extracting OOD encoder features from '
-                        f'{len(ood_imgs)} frames (stride {ood_stride})...')
-            ood_features = ood_extractor.extract_batch(ood_imgs)
+                        f'{len(all_ood_imgs)} frames '
+                        f'({len(ood_imgs)} clean, stride {ood_stride}; '
+                        f'{len(aug_ood_imgs)} augmented)...')
+            # Chunked: the extractor stacks and preprocesses the whole list
+            # into one float32 batch, which at encoder resolution is far
+            # larger than the uint8 frames. The returned vectors are small,
+            # so chunking bounds peak memory without changing the result.
+            ood_features = np.concatenate(
+                [ood_extractor.extract_batch(all_ood_imgs[c:c + _OOD_CHUNK])
+                 for c in range(0, len(all_ood_imgs), _OOD_CHUNK)], axis=0)
             encoder_path = default_encoder_path(model_path)
             ood_extractor.model.save(encoder_path)
             ood_kwargs = dict(
@@ -487,10 +596,20 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         if progress_callback:
             progress_callback('calibrate_ood', 1, 1)
 
+    augmentation_info = {
+        'applied': augmenter is not None,
+        'augmentations': list(aug_list) if augmenter is not None else [],
+        'passes': aug_passes if augmenter is not None else 0,
+        'stride': aug_stride if augmenter is not None else None,
+        'n_augmented_samples': n_aug_samples,
+        'n_clean_samples': len(records),
+        'scope': 'novelty baselines only (confidence/TTA use clean frames)',
+    }
     calib = build_calibration(smoothed, num_passes, alpha,
                               percentiles=percentiles, model_path=model_path,
                               dense2_features=dense2_features,
                               conv5_features=conv5_features,
+                              augmentation_info=augmentation_info,
                               **tta_kwargs, **ood_kwargs)
     out_path = out_path or default_calib_path(model_path)
     save_calibration(calib, out_path)
@@ -514,6 +633,17 @@ def _summary(calib):
                      ('p97', p['p97'])):
         lines.append(f"      variance {v:.6f} -> "
                      f"{variance_to_confidence(v, calib):5.1f}% confidence")
+
+    aug = calib.get('augmentation')
+    if aug:
+        if aug.get('applied'):
+            lines.append(f"  novelty baseline: clean + augmented "
+                         f"({aug['n_augmented_samples']} augmented samples "
+                         f"from {aug['augmentations']}, "
+                         f"{aug['passes']} pass(es))")
+        else:
+            lines.append("  novelty baseline: clean frames only "
+                         "(no AUGMENTATIONS configured)")
 
     ood = calib.get('novelty_ood')
     if ood:
@@ -573,6 +703,16 @@ def main(args=None):
     parser.add_argument('--out', default=None,
                         help='output calibration path '
                              '(default <model>.calib.json)')
+    aug_group = parser.add_mutually_exclusive_group()
+    aug_group.add_argument('--augment', dest='augment', action='store_true',
+                           default=None,
+                           help='widen the novelty baselines with augmented '
+                                'frames (overrides '
+                                'XAI_CALIBRATE_WITH_AUGMENTATIONS)')
+    aug_group.add_argument('--no-augment', dest='augment',
+                           action='store_false',
+                           help='fit the novelty baselines on clean frames '
+                                'only, even if AUGMENTATIONS is configured')
     parsed = parser.parse_args(args)
 
     config_path = parsed.config
@@ -587,7 +727,8 @@ def main(args=None):
 
     calib, out_path = calibrate_from_tub(
         cfg, parsed.tub, parsed.model, num_passes=parsed.passes,
-        alpha=parsed.alpha, limit=parsed.limit, out_path=parsed.out)
+        alpha=parsed.alpha, limit=parsed.limit, out_path=parsed.out,
+        augment=parsed.augment)
 
     print('\nMC-Dropout calibration complete:')
     print(_summary(calib))

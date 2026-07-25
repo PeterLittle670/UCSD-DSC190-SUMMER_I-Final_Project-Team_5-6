@@ -100,6 +100,55 @@ class TestTTACalibration(unittest.TestCase):
         self.assertNotIn('tta', calib)
 
 
+class TestAugmentationProvenance(unittest.TestCase):
+    """The 'augmentation' block records how the novelty baselines were fit
+    (clean-only vs widened with training-style augmented frames), so a
+    calibration can be told apart from an older one after the fact."""
+
+    def _variances(self, n=200, seed=21):
+        return np.random.default_rng(seed).gamma(shape=2.0, scale=0.01, size=n)
+
+    def test_absent_when_not_supplied_keeps_older_calibrations_valid(self):
+        calib = build_calibration(self._variances(), num_passes=15, alpha=0.2)
+        self.assertNotIn('augmentation', calib)
+
+    def test_recorded_verbatim_when_supplied(self):
+        info = {'applied': True, 'augmentations': ['SHADOW', 'GAMMA'],
+                'passes': 2, 'stride': 12, 'n_augmented_samples': 1500,
+                'n_clean_samples': 9221, 'scope': 'novelty baselines only'}
+        calib = build_calibration(self._variances(), num_passes=15, alpha=0.2,
+                                  augmentation_info=info)
+        self.assertEqual(calib['augmentation'], info)
+
+    def test_does_not_disturb_the_confidence_calibration(self):
+        """Provenance is metadata: adding it must not move any number the
+        confidence signal reads."""
+        v = self._variances()
+        plain = build_calibration(v, num_passes=15, alpha=0.2)
+        with_info = build_calibration(v, num_passes=15, alpha=0.2,
+                                      augmentation_info={'applied': False})
+        self.assertEqual(plain['percentiles'], with_info['percentiles'])
+        self.assertEqual(plain['confidence_anchors'],
+                         with_info['confidence_anchors'])
+        self.assertEqual(plain['n_frames'], with_info['n_frames'])
+        self.assertEqual(plain['tiers'], with_info['tiers'])
+
+    def test_n_frames_counts_clean_frames_only(self):
+        """Augmented samples are pooled into the novelty feature matrices but
+        never into the variance distribution, so the reported frame count
+        must still describe the replay, not the enlarged feature set."""
+        rng = np.random.default_rng(31)
+        variances = rng.gamma(shape=2.0, scale=0.01, size=300)
+        # 300 clean frames, but 900 novelty feature vectors (clean + augmented)
+        dense2 = rng.normal(size=(900, 50))
+        calib = build_calibration(variances, num_passes=15, alpha=0.2,
+                                  dense2_features=dense2,
+                                  augmentation_info={'applied': True,
+                                                     'n_augmented_samples': 600})
+        self.assertEqual(calib['n_frames'], 300)
+        self.assertIn('novelty_global', calib)
+
+
 class TestMakeStrictlyIncreasing(unittest.TestCase):
 
     def test_nudges_duplicate_values_strictly_increasing(self):
