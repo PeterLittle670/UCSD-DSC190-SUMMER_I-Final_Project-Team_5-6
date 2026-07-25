@@ -663,8 +663,112 @@ AUGMENTATIONS = []
 # Brightness range for augmentation [-0.2, 0.2].
 AUG_BRIGHTNESS_RANGE = 0.2
 
+# Contrast range for augmentation. Optional - if not set, this defaults to
+# AUG_BRIGHTNESS_RANGE (the previous behaviour, where brightness and
+# contrast used the same limit). Set this only if you want to vary
+# brightness and contrast independently.
+# AUG_CONTRAST_RANGE = 0.2
+
 # Blur range for augmentation (kernel size).
 AUG_BLUR_RANGE = (0, 3)
+
+# Gamma augmentation. Applies a nonlinear brightness curve, which is a
+# closer match to how a camera sensor responds in low light than a plain
+# brightness shift. gamma_limit is a percentage around 100: values below
+# 100 brighten the image (simulates glare / overexposure), values above
+# 100 darken it (simulates dusk / nighttime), so a single range covers
+# both directions. Enable it by adding 'GAMMA' to the AUGMENTATIONS list.
+#
+# Min/max gamma, as a percentage (100 = unchanged).
+AUG_GAMMA_RANGE = (80, 120)
+# Probability that a given training image gets gamma-adjusted (0..1).
+AUG_GAMMA_PROBABILITY = 0.5
+
+# Noise augmentation. Adds Gaussian sensor noise/grain, most noticeable in
+# low-light or nighttime footage, so the model doesn't learn to expect
+# unnaturally clean dark frames. Enable it by adding 'NOISE' to the
+# AUGMENTATIONS list.
+#
+# Min/max noise standard deviation, as a fraction of the image's max pixel
+# value (e.g. 0.1 ~= 10% of 255 for a uint8 image).
+AUG_NOISE_STD_RANGE = (0.05, 0.15)
+# Min/max noise mean offset, as a fraction of the image's max pixel value.
+AUG_NOISE_MEAN_RANGE = (0.0, 0.0)
+# Probability that a given training image gets noise added (0..1).
+AUG_NOISE_PROBABILITY = 0.15
+
+# Shadow augmentation. Adds randomly shaped, randomly placed partial
+# shadows to training images (e.g. tree/building shadows crossing the
+# lane), so the model learns stable road/lane features instead of
+# lighting-specific patterns. Enable it by adding 'SHADOW' to the
+# AUGMENTATIONS list above; like all augmentations this only ever runs
+# during training and has no effect during inference. Overly dark or
+# frequent shadows can make the lane hard to see and hurt training, so
+# keep the darkness range moderate.
+#
+# Probability that a given training image receives a shadow (0..1).
+AUG_SHADOW_PROBABILITY = 0.3
+# Min/max shadow darkness: 0 = no darkening, 1 = fully black.
+AUG_SHADOW_DARKNESS_RANGE = (0.4, 0.7)
+# Min/max number of shadow shapes added per image.
+AUG_SHADOW_COUNT_RANGE = (1, 2)
+# Number of vertices of the random shadow polygon. Higher gives a more
+# irregular, realistic shape.
+AUG_SHADOW_DIMENSION = 5
+# Region of the image (x_min, y_min, x_max, y_max), as fractions of
+# (width, height), where shadows may appear. Defaults to the bottom 70%
+# of the image, which is typically where the road is.
+AUG_SHADOW_ROI = (0.0, 0.3, 1.0, 1.0)
+# Gaussian blur kernel size used to soften the shadow edge so it blends
+# into the image instead of looking like a hard cutout. 0 or 1 = hard edge.
+AUG_SHADOW_BLUR_KSIZE = 21
+
+# Gaussian noise augmentation. Adds per-pixel Gaussian noise to training
+# images to simulate the sensor noise produced by cheap camera modules in
+# low light or fast-changing outdoor conditions, so the model learns to
+# rely on lane features instead of individual noisy pixels. Enable it by
+# adding 'NOISE' to the AUGMENTATIONS list above; like all augmentations
+# this only ever runs during training and has no effect during inference.
+#
+# Probability that a given training image receives noise (0..1).
+AUG_NOISE_PROBABILITY = 0.3
+# Min/max noise standard deviation, as a fraction of the max pixel value
+# (255 for uint8 images). Higher values produce grainier images; keep this
+# moderate so lane markings stay visible.
+AUG_NOISE_STD_RANGE = (0.05, 0.15)
+
+# Local sunlight augmentation. Unlike BRIGHTNESS/GAMMA, which scale the
+# *whole* image, this brightens one or more randomly shaped, randomly
+# placed regions (a blob, a rotated/elongated patch, or a directional band
+# crossing the frame), while the rest of the image is left unchanged. This
+# simulates the mixed lighting seen around midday, where part of the track
+# is in harsh direct sun and part is shaded, often with a sharp boundary
+# between them - something a uniform brightness/gamma shift can't
+# reproduce. Enable it by adding 'SUNLIGHT' to the AUGMENTATIONS list
+# above; like all augmentations this only ever runs during training and
+# has no effect during inference. Excessive strength/coverage can wash out
+# the lane in every sample, so start with the defaults below and increase
+# gradually.
+#
+# Probability that a given training image receives local sunlight (0..1).
+AUG_SUNLIGHT_PROBABILITY = 0.3
+# Min/max lightness multiplier applied inside the sunlit region. 1.0 = no
+# change; e.g. 1.8 = up to 80% brighter at full strength before clipping.
+AUG_SUNLIGHT_STRENGTH_RANGE = (1.15, 1.8)
+# Min/max fraction of the image area the sunlit region(s) should cover
+# (approximately - actual coverage depends on shape and overlap).
+AUG_SUNLIGHT_COVERAGE_RANGE = (0.15, 0.55)
+# Min/max number of separate sunlit regions per image. Keep this small;
+# too many bright patches looks unrealistic.
+AUG_SUNLIGHT_REGION_COUNT_RANGE = (1, 2)
+# Min/max Gaussian blur kernel size used to soften the sunlight edge, so
+# the transition ranges from a soft glow to a near-hard boundary (real
+# sun/shade edges vary). A kernel of 1 leaves that region's edge sharp.
+AUG_SUNLIGHT_BLUR_KERNEL_RANGE = (11, 41)
+# Fraction of image height above which sunlit regions are mostly excluded,
+# so the effect is concentrated on the road rather than the sky. Defaults
+# to the bottom 75% of the image.
+AUG_SUNLIGHT_ROAD_REGION_START = 0.25
 
 
 # ------------------------------------------------------------------------------
@@ -677,6 +781,34 @@ AUG_BLUR_RANGE = (0, 3)
 #   Available augmentations are:
 #   - BRIGHTNESS  - modify the image brightness. See [albumentations](https://albumentations.ai/docs/api_reference/augmentations/transforms/#albumentations.augmentations.transforms.RandomBrightnessContrast)
 #   - BLUR        - blur the image. See [albumentations](https://albumentations.ai/docs/api_reference/augmentations/blur/transforms/#albumentations.augmentations.blur.transforms.Blur)
+#   - SHADOW      - add random partial shadows to simulate changing sunlight
+#   - GAMMA       - nonlinear brightening/darkening, simulates glare and low light
+#   - NOISE       - add sensor grain/noise, simulates low-light camera footage
+#   - SUNLIGHT    - add one or more localized bright regions, simulates mixed sun/shade at midday
+#
+# Example AUGMENTATIONS profiles - copy the list (and any of the AUG_*
+# overrides mentioned) into your myconfig.py. These are starting points,
+# not required settings.
+#   - indoor:          ['BRIGHTNESS', 'GAMMA']
+#   - outdoor:         ['BRIGHTNESS', 'SHADOW', 'BLUR']
+#   - low_light:       ['GAMMA', 'NOISE', 'SHADOW']
+#   - noon:            ['SUNLIGHT', 'SHADOW', 'GAMMA', 'BRIGHTNESS', 'NOISE', 'BLUR']
+#     For driving around midday, where the track has sharp sun/shade
+#     boundaries. Order matters: local lighting effects (SUNLIGHT, SHADOW)
+#     are applied to clean pixels first, then global tone adjustments
+#     (GAMMA, BRIGHTNESS), then sensor-level NOISE, then BLUR last to
+#     simulate optical softening of the final image. SUNLIGHT and SHADOW
+#     each have their own independent probability
+#     (AUG_SUNLIGHT_PROBABILITY / AUG_SHADOW_PROBABILITY), so most images
+#     get at most one of the two rather than both stacked together.
+#   - all_conditions:  ['BRIGHTNESS', 'BLUR', 'SHADOW', 'GAMMA', 'NOISE']
+#     Recommended starting point when training a single model on combined
+#     day/midday/night data, since it covers exposure variation, partial
+#     shadows, nonlinear day<->night lighting changes, and low-light
+#     sensor grain together. Consider widening AUG_GAMMA_RANGE (e.g. to
+#     (60, 160)) so it covers stronger night darkening and midday glare.
+#     Add 'SUNLIGHT' too (see the 'noon' profile above) if midday mixed
+#     lighting is part of your training data.
 #
 # - Transformations are changes to the image that apply both in
 #   training and at inference.  They are always applied and in
