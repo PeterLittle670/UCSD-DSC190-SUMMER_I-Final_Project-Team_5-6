@@ -687,15 +687,17 @@ AUG_GAMMA_PROBABILITY = 0.5
 # Noise augmentation. Adds Gaussian sensor noise/grain, most noticeable in
 # low-light or nighttime footage, so the model doesn't learn to expect
 # unnaturally clean dark frames. Enable it by adding 'NOISE' to the
-# AUGMENTATIONS list.
+# AUGMENTATIONS list; like all augmentations this only ever runs during
+# training and has no effect during inference.
 #
+# Probability that a given training image receives noise (0..1).
+AUG_NOISE_PROBABILITY = 0.3
 # Min/max noise standard deviation, as a fraction of the image's max pixel
-# value (e.g. 0.1 ~= 10% of 255 for a uint8 image).
+# value (e.g. 0.1 ~= 10% of 255 for a uint8 image). Higher values produce
+# grainier images; keep this moderate so lane markings stay visible.
 AUG_NOISE_STD_RANGE = (0.05, 0.15)
 # Min/max noise mean offset, as a fraction of the image's max pixel value.
 AUG_NOISE_MEAN_RANGE = (0.0, 0.0)
-# Probability that a given training image gets noise added (0..1).
-AUG_NOISE_PROBABILITY = 0.15
 
 # Shadow augmentation. Adds randomly shaped, randomly placed partial
 # shadows to training images (e.g. tree/building shadows crossing the
@@ -722,20 +724,6 @@ AUG_SHADOW_ROI = (0.0, 0.3, 1.0, 1.0)
 # Gaussian blur kernel size used to soften the shadow edge so it blends
 # into the image instead of looking like a hard cutout. 0 or 1 = hard edge.
 AUG_SHADOW_BLUR_KSIZE = 21
-
-# Gaussian noise augmentation. Adds per-pixel Gaussian noise to training
-# images to simulate the sensor noise produced by cheap camera modules in
-# low light or fast-changing outdoor conditions, so the model learns to
-# rely on lane features instead of individual noisy pixels. Enable it by
-# adding 'NOISE' to the AUGMENTATIONS list above; like all augmentations
-# this only ever runs during training and has no effect during inference.
-#
-# Probability that a given training image receives noise (0..1).
-AUG_NOISE_PROBABILITY = 0.3
-# Min/max noise standard deviation, as a fraction of the max pixel value
-# (255 for uint8 images). Higher values produce grainier images; keep this
-# moderate so lane markings stay visible.
-AUG_NOISE_STD_RANGE = (0.05, 0.15)
 
 # Local sunlight augmentation. Unlike BRIGHTNESS/GAMMA, which scale the
 # *whole* image, this brightens one or more randomly shaped, randomly
