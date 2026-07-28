@@ -27,8 +27,8 @@ from depthai import Pipeline, DataOutputQueue, ImgFrame, ImgDetections, ImgDetec
 from numpy import ndarray
 from typing import List
 
-WIDTH = 640
-HEIGHT = 480
+WIDTH = 192
+HEIGHT = 108
 
 
 class OakD(object):
