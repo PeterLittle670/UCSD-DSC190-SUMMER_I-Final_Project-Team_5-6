@@ -17,16 +17,23 @@
   }
   header h1 { font-size: 16px; margin: 0; }
   header .meta { font-size: 12px; color: #57606a; }
-  main { max-width: 980px; margin: 14px auto; padding: 0 14px; }
+  main { max-width: 1280px; margin: 14px auto; padding: 0 14px; }
   .panel {
     background: #fff; border: 1px solid #d8dee4; border-radius: 6px;
     padding: 12px; margin-bottom: 14px;
   }
-  #img-wrap { position: relative; text-align: center; background: #0d1117;
-              border-radius: 4px; }
+  /* The wrapper's aspect ratio is set from the first real frame that loads
+     (see seek()), so the stage matches the actual footage instead of a
+     hardcoded 4:3 that letterboxes 16:9 frames. 16/9 is only the starting
+     guess before anything has loaded. Keeping the ratio on the wrapper (not
+     the img) means the "unavailable" placeholder, which has its own size,
+     drops into the same box without shifting the layout. */
+  #img-wrap { position: relative; background: #0d1117; border-radius: 4px;
+              display: flex; align-items: center; justify-content: center;
+              overflow: hidden; aspect-ratio: 16 / 9; max-height: 78vh; }
   #frame-img {
-    image-rendering: auto; width: 100%; max-width: 640px; display: inline-block;
-    aspect-ratio: 4 / 3; object-fit: contain;
+    image-rendering: auto; display: block;
+    width: 100%; height: 100%; object-fit: contain;
   }
   #badge {
     position: absolute; top: 8px; left: 8px; font-size: 11px;
@@ -162,7 +169,8 @@
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
-  const img = $('frame-img'), badge = $('badge'), scrub = $('scrub'),
+  const img = $('frame-img'), imgWrap = $('img-wrap'), badge = $('badge'),
+        scrub = $('scrub'),
         playBtn = $('play'), fpsSel = $('fps'), layerSel = $('layer'),
         analyzedOnly = $('analyzed-only'), readout = $('readout'),
         canvas = $('graph'), layerExplain = $('layer-explain'),
@@ -360,6 +368,14 @@
     const src = entryImage(entry);
     img.onerror = () => { img.onerror = null; img.src = PLACEHOLDER;
                           showBadge('frame image unavailable'); };
+    // Size the stage to whatever this frame actually is. Camera frames and
+    // model-sized overlays don't always share a ratio, so read it per load
+    // rather than assuming one.
+    img.onload = () => {
+      if (img.src === PLACEHOLDER) return;   // keep the last real ratio
+      const w = img.naturalWidth, h = img.naturalHeight;
+      if (w > 0 && h > 0) imgWrap.style.aspectRatio = w + ' / ' + h;
+    };
     if (src) { img.src = src; } else { img.src = PLACEHOLDER; }
 
     if (f) {
