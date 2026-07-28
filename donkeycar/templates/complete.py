@@ -430,23 +430,27 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         use_mc_dropout = getattr(cfg, 'XAI_CONFIDENCE_ENABLED', False)
         if use_mc_dropout:
             from donkeycar.parts.mc_dropout import MCDropoutConfidence
-            from donkeycar.parts.mc_calibrate import default_calib_path
+            from donkeycar.parts.mc_calibrate import (default_calib_path,
+                                                      missing_calibration_reason)
             n_passes = getattr(cfg, 'XAI_CONFIDENCE_PASSES', 15)
             alpha = getattr(cfg, 'XAI_CONFIDENCE_ALPHA', 0.2)
             mc_interval = getattr(cfg, 'XAI_CONFIDENCE_INTERVAL', 0.0)
-            # Look for a calibration file next to the model so the dashboard
-            # can show a confidence %. Absent -> variance still logged, but
-            # confidence displays as "not calibrated".
+            # Look for this signal's calibration DATA next to the model so the
+            # dashboard can show a confidence %. Checking the block (not just
+            # that the file exists) matters: a calib.json written by an older
+            # version can be present but lack this signal, which would
+            # otherwise show no panel and no banner -- indistinguishable from
+            # the feature being switched off.
             calib_path = default_calib_path(model_path)
-            if not os.path.exists(calib_path):
-                logger.warning(f"No calibration found at {calib_path}; run "
+            reason = missing_calibration_reason(calib_path, 'confidence')
+            if reason:
+                logger.warning(f"Confidence not calibrated: {reason}; run "
                                f"'python -m donkeycar.parts.mc_calibrate' to "
                                f"enable the confidence %. Variance still logged.")
                 xai_uncalibrated.append({
                     'signal': 'confidence', 'label': 'Confidence',
-                    'message': f"Enabled, but {os.path.basename(calib_path)} "
-                               f"doesn't exist yet, so this won't show a %. "
-                               f"Run: python -m donkeycar.parts.mc_calibrate "
+                    'message': f"Enabled, but {reason}, so this won't show a "
+                               f"%. Run: python -m donkeycar.parts.mc_calibrate "
                                f"--tub <training tub> --model {model_path}"})
                 calib_path = None
             logger.info(f"Enabling MC-Dropout confidence (N={n_passes}, "
@@ -474,18 +478,18 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         use_novelty = getattr(cfg, 'XAI_NOVELTY_ENABLED', False)
         if use_novelty:
             from donkeycar.parts.novelty import FeatureNoveltyDetector
-            from donkeycar.parts.mc_calibrate import default_calib_path
+            from donkeycar.parts.mc_calibrate import (default_calib_path,
+                                                      missing_calibration_reason)
             novelty_calib_path = default_calib_path(model_path)
-            if not os.path.exists(novelty_calib_path):
-                logger.warning(f"No calibration found at {novelty_calib_path}; "
+            reason = missing_calibration_reason(novelty_calib_path, 'novelty')
+            if reason:
+                logger.warning(f"Novelty not calibrated: {reason}; "
                                f"run 'python -m donkeycar.parts.mc_calibrate' "
                                f"to enable novelty detection.")
                 xai_uncalibrated.append({
                     'signal': 'novelty', 'label': 'Novelty',
-                    'message': f"Enabled, but "
-                               f"{os.path.basename(novelty_calib_path)} "
-                               f"doesn't exist yet, so this won't show a %. "
-                               f"Run: python -m donkeycar.parts.mc_calibrate "
+                    'message': f"Enabled, but {reason}, so this won't show a "
+                               f"%. Run: python -m donkeycar.parts.mc_calibrate "
                                f"--tub <training tub> --model {model_path}"})
                 novelty_calib_path = None
             logger.info("Enabling feature-space novelty detection")
@@ -509,19 +513,19 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         use_tta = getattr(cfg, 'XAI_TTA_ENABLED', False)
         if use_tta:
             from donkeycar.parts.tta import TTAStabilityDetector
-            from donkeycar.parts.mc_calibrate import default_calib_path
+            from donkeycar.parts.mc_calibrate import (default_calib_path,
+                                                      missing_calibration_reason)
             tta_calib_path = default_calib_path(model_path)
-            if not os.path.exists(tta_calib_path):
-                logger.warning(f"No calibration found at {tta_calib_path}; "
+            reason = missing_calibration_reason(tta_calib_path, 'tta')
+            if reason:
+                logger.warning(f"TTA stability not calibrated: {reason}; "
                                f"with XAI_TTA_ENABLED already on, run "
                                f"'python -m donkeycar.parts.mc_calibrate' to "
                                f"add the TTA stability %.")
                 xai_uncalibrated.append({
                     'signal': 'tta', 'label': 'TTA stability',
-                    'message': f"Enabled, but "
-                               f"{os.path.basename(tta_calib_path)} doesn't "
-                               f"exist yet, so this won't show a %. Run: "
-                               f"python -m donkeycar.parts.mc_calibrate "
+                    'message': f"Enabled, but {reason}, so this won't show a "
+                               f"%. Run: python -m donkeycar.parts.mc_calibrate "
                                f"--tub <training tub> --model {model_path}"})
                 tta_calib_path = None
             logger.info("Enabling test-time augmentation (TTA) stability")
@@ -722,7 +726,28 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         cfg.AUTO_CREATE_NEW_TUB else cfg.DATA_PATH
     meta += getattr(cfg, 'METADATA', [])
     tub_writer = TubWriter(tub_path, inputs=inputs, types=types, metadata=meta)
-    V.add(tub_writer, inputs=inputs, outputs=["tub/num_records"], run_condition='recording')
+
+    if cfg.RECORD_DURING_AI:
+        # Keep autopilot-driven frames out of the manual/training tub
+        # entirely, instead of mixing them into tub_path and relying on
+        # someone to filter them back out before training. The manual tub's
+        # own path/name is completely unchanged by this; autopilot frames are
+        # written to a sibling "<tub_path>_autopilot" tub instead.
+        V.add(Lambda(lambda recording, mode: (recording and mode == 'user',
+                                               recording and mode != 'user')),
+              inputs=['recording', 'user/mode'],
+              outputs=['recording/user', 'recording/autopilot'])
+        V.add(tub_writer, inputs=inputs, outputs=["tub/num_records"],
+              run_condition='recording/user')
+
+        autopilot_tub_writer = TubWriter(str(tub_path) + '_autopilot',
+                                          inputs=inputs, types=types,
+                                          metadata=meta)
+        V.add(autopilot_tub_writer, inputs=inputs,
+              outputs=["tub/num_records_autopilot"],
+              run_condition='recording/autopilot')
+    else:
+        V.add(tub_writer, inputs=inputs, outputs=["tub/num_records"], run_condition='recording')
 
     # Telemetry (we add the same metrics added to the TubHandler
     if cfg.HAVE_MQTT_TELEMETRY:

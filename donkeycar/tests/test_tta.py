@@ -107,6 +107,31 @@ class TestTTAStabilityDetector(unittest.TestCase):
         self.assertEqual(raw_var, 0.0)
         self.assertEqual(smoothed_var, 0.0)
 
+    def test_always_measure_runs_the_pass_even_without_calibration(self):
+        # Calibration is the one caller that MUST measure while uncalibrated
+        # -- measuring those variances is how the 'tta' block gets built. If
+        # the skip above applied there too, every collected variance would be
+        # 0.0 and the resulting block would be degenerate.
+        part = TTAStabilityDetector(self.pilot, num_samples=8, seed=0,
+                                    always_measure=True)
+        self.assertIsNone(part.calibration)
+        calls = {'n': 0}
+        real_model = part.model
+
+        def counting_call(*a, **kw):
+            calls['n'] += 1
+            return real_model(*a, **kw)
+
+        part.model = counting_call
+        stability, raw_var, smoothed_var = part.run(self.img)
+        self.assertEqual(calls['n'], 1)       # the M-pass batch DID run
+        self.assertIsNone(stability)          # still no score without calib
+        self.assertGreater(raw_var, 0.0)      # and a real variance came back
+
+    def test_always_measure_defaults_off_so_live_driving_is_unchanged(self):
+        part = TTAStabilityDetector(self.pilot, num_samples=8, seed=0)
+        self.assertFalse(part.always_measure)
+
     def test_stability_uses_calibration_block_when_present(self):
         part = TTAStabilityDetector(self.pilot, num_samples=8, seed=0)
         # Attach a real tta block built from a synthetic variance distribution.

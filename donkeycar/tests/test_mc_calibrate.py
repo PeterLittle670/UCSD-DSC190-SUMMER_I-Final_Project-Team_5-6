@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -5,6 +8,7 @@ import numpy as np
 from donkeycar.parts.mc_calibrate import (
     build_calibration, variance_to_confidence, novelty_distance_to_score,
     tta_variance_to_stability, _make_strictly_increasing,
+    missing_calibration_reason,
 )
 
 
@@ -147,6 +151,52 @@ class TestAugmentationProvenance(unittest.TestCase):
                                                      'n_augmented_samples': 600})
         self.assertEqual(calib['n_frames'], 300)
         self.assertIn('novelty_global', calib)
+
+
+class TestMissingCalibrationReason(unittest.TestCase):
+    """A calib.json can exist while lacking the block a given signal needs
+    (e.g. written before that signal shipped). Checking only for the file
+    would leave that signal silently blank on the dashboard -- no panel and
+    no 'not calibrated' banner, indistinguishable from the feature being off.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, 'model.calib.json')
+
+    def _write(self, calib):
+        with open(self.path, 'w') as f:
+            json.dump(calib, f)
+        return self.path
+
+    def test_absent_file_is_reported_for_every_signal(self):
+        missing = os.path.join(self.tmp, 'nope.calib.json')
+        for signal in ('confidence', 'novelty', 'tta'):
+            reason = missing_calibration_reason(missing, signal)
+            self.assertIsNotNone(reason)
+            self.assertIn("doesn't exist", reason)
+
+    def test_present_block_reports_no_reason(self):
+        self._write({'confidence_anchors': {}, 'novelty_ood': {}, 'tta': {}})
+        for signal in ('confidence', 'novelty', 'tta'):
+            self.assertIsNone(missing_calibration_reason(self.path, signal))
+
+    def test_file_present_but_block_missing_is_still_reported(self):
+        # The realistic case: an older calibration with confidence+novelty
+        # but no TTA block.
+        self._write({'confidence_anchors': {}, 'novelty_ood': {}})
+        self.assertIsNone(missing_calibration_reason(self.path, 'confidence'))
+        self.assertIsNone(missing_calibration_reason(self.path, 'novelty'))
+        tta_reason = missing_calibration_reason(self.path, 'tta')
+        self.assertIsNotNone(tta_reason)
+        self.assertIn('tta', tta_reason)
+
+    def test_unreadable_file_is_reported_rather_than_raising(self):
+        with open(self.path, 'w') as f:
+            f.write('{not valid json')
+        reason = missing_calibration_reason(self.path, 'confidence')
+        self.assertIsNotNone(reason)
+        self.assertIn('could not be read', reason)
 
 
 class TestMakeStrictlyIncreasing(unittest.TestCase):

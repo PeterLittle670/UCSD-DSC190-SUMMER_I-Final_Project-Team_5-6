@@ -513,12 +513,13 @@ CACHE_POLICY = 'ARRAY'
 XAI_CONFIDENCE_ENABLED = False   # master on/off for the confidence signal
 XAI_CONFIDENCE_PASSES = 15       # number of stochastic forward passes per frame
 XAI_CONFIDENCE_ALPHA = 0.2       # EMA smoothing of the variance (0..1, higher=faster)
-# Minimum seconds between confidence updates. 0 = every frame (default).
-# E.g. 0.15 updates confidence ~6-7x/sec; between updates the car still
-# steers every frame via a cheap single-pass inference, only the confidence
-# numbers are held. Reduces average compute load on slow hardware (Pi), at
-# the cost of a periodic slower loop iteration when the N-pass update runs.
-XAI_CONFIDENCE_INTERVAL = 0.0
+# Minimum seconds between confidence updates. 0 = every frame; the default
+# below (0.3) updates confidence ~3x/sec instead. Between updates the car
+# still steers every frame via a cheap single-pass inference -- only the
+# confidence number is held, so this never costs driving responsiveness.
+# Reduces average compute load on slow hardware (Pi) by cutting how often
+# the expensive N-pass update runs.
+XAI_CONFIDENCE_INTERVAL = 0.3
 # When True, training automatically builds the confidence (and novelty)
 # calibration on the training tubs and saves <model>.calib.json next to the
 # model, so the model ships ready for the dashboard. Adds a replay pass
@@ -573,11 +574,13 @@ XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
 XAI_NOVELTY_ENCODER = 'mobilenet_v2'   # generic feature encoder ('mobilenet_v2'|'mobilenet')
 XAI_NOVELTY_ENCODER_INPUT = 128        # square input size fed to the encoder
 XAI_NOVELTY_ENCODER_ALPHA = 1.0        # encoder width multiplier (smaller=faster, e.g. 0.35 on a Pi)
-# Minimum seconds between novelty updates. 0 = every frame (default). Unlike
-# confidence's interval, a held frame here costs NOTHING -- this signal never
-# drives, so between updates it just holds the last score with zero forward
-# passes, instead of falling back to a cheap pass.
-XAI_NOVELTY_INTERVAL = 0.0
+# Minimum seconds between novelty updates. 0 = every frame; the default below
+# (0.3) updates novelty ~3x/sec instead. Unlike confidence's interval, a held
+# frame here costs NOTHING -- this signal never drives, so between updates it
+# just holds the last score with zero forward passes, instead of falling back
+# to a cheap pass. See the note by XAI_THROTTLE_STOP_DURATION below for how
+# this interacts with throttle scaling's reaction time.
+XAI_NOVELTY_INTERVAL = 0.3
 
 # --- Signal 3: test-time augmentation (TTA) stability --------------------
 # Runs the DETERMINISTIC model on M photometrically-augmented copies of the
@@ -587,18 +590,22 @@ XAI_NOVELTY_INTERVAL = 0.0
 # the model's weights, novelty probes the scene, TTA probes robustness to
 # input perturbation. Photometric augmentation only (brightness/contrast/gamma
 # /noise) -- never geometric, which would change the correct steering answer.
-# M forward passes batched into one call, cheap enough for live use. Needs a
-# calibration with a "tta" block (recalibrate with this ON to add it).
-XAI_TTA_ENABLED = False       # master on/off for the TTA stability signal
+# M forward passes batched into one call, cheap enough for live use.
+# This flag only controls whether the signal runs while DRIVING. Calibration
+# always builds the "tta" block regardless, so you can switch this on later
+# without re-running calibration.
+XAI_TTA_ENABLED = False       # master on/off for the TTA stability signal (live only)
 XAI_TTA_SAMPLES = 8           # M, number of augmented copies per frame
 XAI_TTA_ALPHA = 0.2           # EMA smoothing of the steering variance
-# Minimum seconds between TTA updates. 0 = every frame (default), which means
-# M forward passes EVERY frame -- the most expensive of the three signals per
-# update. A held frame costs zero forward passes (this signal never drives).
-# If running confidence + novelty + TTA together is straining the hardware
-# (Pi power draw, brownouts), raise this first -- it has the biggest single
-# per-frame cost of the three. E.g. 0.2 caps TTA updates to ~5x/sec.
-XAI_TTA_INTERVAL = 0.0
+# Minimum seconds between TTA updates. 0 = every frame, which means M forward
+# passes EVERY frame -- the most expensive of the three signals per update.
+# A held frame costs zero forward passes (this signal never drives). The
+# default below (0.5, i.e. ~2x/sec) is the most relaxed of the three since TTA
+# has the biggest single per-frame cost -- if confidence + novelty + TTA
+# together is straining the hardware (Pi power draw, brownouts), this is the
+# first knob to raise further. See the note by XAI_THROTTLE_STOP_DURATION
+# below for how this interacts with throttle scaling's reaction time.
+XAI_TTA_INTERVAL = 0.5
 XAI_TTA_STRENGTH = 0.2        # photometric jitter strength (0..1); 0 = no augmentation
 
 # --- Throttle scaling (Feature 2) -----------------------------------------
@@ -615,6 +622,13 @@ XAI_NOVELTY_CRITICAL_THRESHOLD = 65.0      # above this novelty %, critical tier
 XAI_TTA_REDUCED_THRESHOLD = 65.0           # below this stability %, start scaling
 XAI_TTA_CRITICAL_THRESHOLD = 25.0          # below this stability %, critical tier
 XAI_THROTTLE_MIN_SCALE = 0.4    # floor: never below 40% from any single signal
+# Secs sustained-critical (any signal) before full stop. If you also raised
+# XAI_NOVELTY_INTERVAL / XAI_TTA_INTERVAL to reduce compute load, know that
+# those signals can now be stale by up to that many seconds before a new
+# reading even arrives -- worst case, this adds to that delay before the car
+# reacts (e.g. NOVELTY_INTERVAL=0.3 + STOP_DURATION=1.0 -> up to ~1.3s before
+# a full stop). Fine for dashboard/monitoring use; worth tightening the
+# interval(s) back down if you're relying on this for real-time braking.
 XAI_THROTTLE_STOP_DURATION = 1.0   # secs sustained-critical (any signal) before full stop
 
 # --- Offline analysis (Grad-CAM tool) -------------------------------------
@@ -1007,7 +1021,10 @@ STOP_SIGN_REVERSE_THROTTLE = -0.5
 # Automatically record data when throttle is > 0 (Standard training data collection).
 AUTO_RECORD_ON_THROTTLE = True
 
-# Record data even when the AI is driving (Careful: don't train on this data!).
+# Record data even when the AI is driving, e.g. to review an autonomous run
+# afterwards. These frames are automatically written to a separate
+# "<tub>_autopilot" tub instead of your regular training tub, so they can
+# never end up mixed into training data by accident.
 RECORD_DURING_AI = False
 
 # Create a new directory for every session (True) or append to existing (False).

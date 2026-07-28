@@ -32,6 +32,14 @@ Calibration sits in the middle because every downstream piece — the live dashb
 
 No changes here — record a tub and train exactly as stock Donkeycar describes (`donkey train`). The XAI toolkit only reads the model file afterwards; it doesn't change how training itself works. One thing to know: MC-Dropout confidence (and, by extension, most of this toolkit) currently only supports the `linear` model type, since it relies on the `Dropout` layers already present in that architecture staying active at inference time — see [§2.2](#22-dropout-and-monte-carlo-dropout-confidence) for why.
 
+**Recording an autopilot drive (for offline review, not for training).** By default Donkeycar only records frames while you're driving in `'user'` (manual) mode — switching into autopilot stops recording, even if the recording toggle is on. If you want to feed an actual autonomous run into this toolkit's offline viewer (§1.6), for example to see what the model was looking at right before a near-miss, set the stock Donkeycar option in `myconfig.py`:
+
+```python
+RECORD_DURING_AI = True
+```
+
+Autopilot frames recorded this way are automatically written to a separate tub — a sibling folder named `<your_tub>_autopilot` next to your regular tub — instead of being mixed into your training data. Your manual tub's name and location never change. This happens automatically as soon as `RECORD_DURING_AI` is on; there's nothing else to configure, and no risk of an autonomous run accidentally ending up in a `donkey train` run, since that command only ever looks at the tub path(s) you explicitly give it.
+
 ### 1.3 Calibration
 
 Calibration replays a tub of "known good" driving through the model once and records how the raw signals behave on data the model actually learned from — this becomes the yardstick every live percentage is measured against. **Nothing lights up on the dashboard until this has run once** for a given model.
@@ -69,10 +77,13 @@ usage: mc_calibrate [-h] --tub TUB [TUB ...] --model MODEL [--config CONFIG]
 
 Point `--tub` at the **same data the model was actually trained on** — calibration is meant to answer "what does normal look like to this model," and calibrating against a different drive (e.g. a test/inference tub) silently defeats the whole signal. The offline GUI launcher (§1.6) tries to auto-detect this for you from Donkeycar's own training record; the CLI here has no such lookup, so it's on you to point `--tub` correctly.
 
+One calibration run covers **all three signals at once** — confidence, novelty and TTA stability are always all written into the file, whether or not you currently have them switched on for driving. So turning `XAI_TTA_ENABLED` (or any other signal) on later just works; you don't need to recalibrate to "add" it.
+
 **When to recalibrate:**
-- After enabling `XAI_TTA_ENABLED` for the first time (its calibration block doesn't exist yet).
+- After retraining or swapping the model (new weights mean the old numbers no longer describe it).
 - After changing `AUGMENTATIONS` in a meaningful way (see [§2.8](#28-how-augmentations-feed-into-calibration)).
-- After retraining the model at all (a new model has new internal weights, so the old calibration numbers no longer correspond to anything).
+
+**On image size:** calibration and offline analysis both read the input size directly from the model file, so a model trained at a different resolution than your current config still works — you'll just see a warning saying which size was used. If that warning looks wrong, point `--config` at the `config.py` the model was actually trained with.
 
 ### 1.4 Driving live with the signals on
 
@@ -96,7 +107,7 @@ Once enabled and calibrated, driving with the web dashboard open shows a panel p
 
 **If a signal is enabled but not yet calibrated**, its panel simply never appears — instead, on connecting to the dashboard you'll see a dismissible amber banner: *"Not calibrated: the following won't show a percentage until calibrated,"* listing exactly which signal(s) and which model file. Go run calibration (§1.3) and reconnect.
 
-**Pi / performance tuning:** each signal has its own `XAI_*_INTERVAL` (seconds; `0.0` = every frame, the default). Setting e.g. `XAI_TTA_INTERVAL = 0.5` re-checks stability twice a second instead of every frame — the displayed value is simply held between updates. TTA is the most expensive signal (it runs `XAI_TTA_SAMPLES` extra forward passes per update), so it's the first knob to turn if a Raspberry Pi is struggling to keep up with `DRIVE_LOOP_HZ`.
+**Pi / performance tuning:** each signal has its own `XAI_*_INTERVAL` (seconds; `0.0` = every frame, no rate-limiting at all). Out of the box these are already relaxed rather than `0.0` — confidence and novelty default to `0.3` (~3 updates/sec), TTA to `0.5` (~2 updates/sec) since it's the priciest signal (it runs `XAI_TTA_SAMPLES` extra forward passes per update). Confidence never costs steering responsiveness either way — the car still steers on a cheap single-pass inference every frame regardless of its interval, only the confidence *number* updates less often. Novelty and TTA are pure observers, so a held frame between updates costs zero forward passes. Raise any of these further if a Raspberry Pi is still struggling to keep up with `DRIVE_LOOP_HZ` — TTA is the first knob to turn. See [§1.5](#15-confidence-aware-throttle-scaling) for how a longer interval trades off against throttle-scaling reaction time.
 
 ### 1.5 Confidence-aware throttle scaling
 
@@ -107,6 +118,8 @@ XAI_THROTTLE_SCALING_ENABLED = True
 ```
 
 With this on, whichever of confidence/novelty/stability is enabled gets combined: if any signal crosses its "reduced" threshold, throttle is scaled down (linearly, down to `XAI_THROTTLE_MIN_SCALE`, default `0.4` = never below 40% of the commanded throttle from a single signal); if any signal is past its "critical" threshold continuously for `XAI_THROTTLE_STOP_DURATION` seconds (default `1.0`), throttle is forced to zero. It only ever touches throttle — steering is never modified. Turning this on without enabling at least one of the three signals just logs a warning and does nothing (there's nothing to scale on).
+
+**Reaction-time tradeoff with the interval knobs (§1.4):** novelty and TTA are only ever as fresh as their `XAI_*_INTERVAL` — a sudden problem won't be seen until the next scheduled update, up to that many seconds later, and `XAI_THROTTLE_STOP_DURATION` then still needs to see it stay critical continuously before forcing a stop. At the defaults, that's roughly up to `0.3 + 1.0 = 1.3s` for novelty-triggered or `0.5 + 1.0 = 1.5s` for TTA-triggered stops, worst case. That's fine if you're using these signals for dashboard/monitoring, but if you're relying on `XAI_THROTTLE_SCALING_ENABLED` as a real-time safety net, consider lowering `XAI_NOVELTY_INTERVAL`/`XAI_TTA_INTERVAL` back toward `0.0` so the car reacts faster, at the cost of more compute per frame.
 
 ### 1.6 Offline analysis — the GUI launcher (recommended)
 
@@ -185,7 +198,7 @@ python -m donkeycar.parts.uncertainty_viewer --analysis data/mytub/gradcam_analy
 XAI_CONFIDENCE_ENABLED = False           # master on/off
 XAI_CONFIDENCE_PASSES = 15               # stochastic forward passes per frame
 XAI_CONFIDENCE_ALPHA = 0.2               # EMA smoothing of the variance
-XAI_CONFIDENCE_INTERVAL = 0.0            # seconds between updates (0 = every frame)
+XAI_CONFIDENCE_INTERVAL = 0.3            # seconds between updates (0 = every frame, no rate-limiting)
 XAI_CONFIDENCE_AUTO_CALIBRATE = False    # calibrate automatically after donkey train
 XAI_CONFIDENCE_CALIBRATE_LIMIT = None    # cap frames used for auto-calibration
 ```
@@ -201,7 +214,7 @@ XAI_NOVELTY_ALPHA = 0.2
 XAI_NOVELTY_ENCODER = 'mobilenet_v2'     # 'mobilenet_v2' | 'mobilenet'
 XAI_NOVELTY_ENCODER_INPUT = 128          # square input size fed to the encoder
 XAI_NOVELTY_ENCODER_ALPHA = 1.0          # encoder width multiplier (e.g. 0.35 on a Pi)
-XAI_NOVELTY_INTERVAL = 0.0
+XAI_NOVELTY_INTERVAL = 0.3                # seconds between updates (0 = every frame, no rate-limiting)
 ```
 
 </details>
@@ -213,7 +226,7 @@ XAI_NOVELTY_INTERVAL = 0.0
 XAI_TTA_ENABLED = False
 XAI_TTA_SAMPLES = 8       # M, augmented copies per frame
 XAI_TTA_ALPHA = 0.2
-XAI_TTA_INTERVAL = 0.0
+XAI_TTA_INTERVAL = 0.5    # seconds between updates (0 = every frame, no rate-limiting)
 XAI_TTA_STRENGTH = 0.2    # photometric jitter strength (0 = no augmentation)
 ```
 
@@ -231,7 +244,7 @@ XAI_NOVELTY_CRITICAL_THRESHOLD = 65.0
 XAI_TTA_REDUCED_THRESHOLD = 65.0
 XAI_TTA_CRITICAL_THRESHOLD = 25.0
 XAI_THROTTLE_MIN_SCALE = 0.4
-XAI_THROTTLE_STOP_DURATION = 1.0
+XAI_THROTTLE_STOP_DURATION = 1.0   # see the reaction-time note in §1.5
 ```
 
 </details>
@@ -254,7 +267,8 @@ XAI_CALIBRATE_AUG_MAX_SAMPLES = 1500
 - **`linear` model type only**, for the same reason.
 - **A calibrated confidence % is not a probability.** It's a percentile rank relative to your own training data's variance distribution — see [§2.3](#23-calibration-mechanics) before treating it as "the model is X% likely to be right."
 - **Novelty saturates at the extremes.** Wildly out-of-distribution input (camera covered, solid color, pointed at a wall) reads as ~98%, same as any other very-unfamiliar scene — it tells you *that* something is unfamiliar, not *how* unfamiliar in fine detail.
-- Recalibration triggers are listed in §1.3 — it's easy to forget after enabling TTA or changing augmentations, and the dashboard's "uncalibrated" banner is there specifically to catch that.
+- Recalibration triggers are listed in §1.3 — it's easy to forget after retraining or changing augmentations, and the dashboard's "uncalibrated" banner is there specifically to catch that. The banner checks each signal's *data*, not just that a calibration file exists, so a calibration written by an older version will still correctly report which signal is missing.
+- **`RECORD_DURING_AI`** (§1.2) writes autopilot frames to a separate `<tub>_autopilot` folder automatically — nothing further to configure, and nothing to remember before training.
 
 ---
 

@@ -95,7 +95,14 @@ class LauncherState:
         models_dir = os.path.join(self.cwd, 'models')
         if os.path.isdir(models_dir):
             for name in sorted(os.listdir(models_dir)):
-                if name.lower().endswith('.h5'):
+                lower = name.lower()
+                # Skip the OOD-encoder sidecars this toolkit writes next to
+                # each model (<model>.novelty_encoder.h5). They're .h5 files
+                # but not pilots, and offering them here doubles the list with
+                # entries that can only ever fail if picked.
+                if lower.endswith('.novelty_encoder.h5'):
+                    continue
+                if lower.endswith('.h5'):
                     models.append(os.path.join('models', name))
 
         return {'tubs': tubs, 'models': models}

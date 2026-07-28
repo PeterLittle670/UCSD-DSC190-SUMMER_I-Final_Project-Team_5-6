@@ -362,6 +362,88 @@ def load_calibration(path):
         return json.load(f)
 
 
+# Which top-level calibration block each live signal actually needs. A
+# calib.json can exist while still lacking the block for a given signal --
+# e.g. one written before that signal existed -- so callers must check for
+# the BLOCK, not merely for the file.
+_SIGNAL_BLOCKS = {
+    'confidence': 'confidence_anchors',
+    'novelty': 'novelty_ood',
+    'tta': 'tta',
+}
+
+
+def missing_calibration_reason(calib_path, signal):
+    """
+    Why ``signal`` can't display a % from ``calib_path``, or None if it can.
+
+    Returns a short human-readable reason string suitable for showing in the
+    dashboard's "not calibrated" banner. Distinguishes the two cases that
+    look identical to a user but need different fixes:
+      * the calibration file doesn't exist at all, versus
+      * the file exists but predates (or was built without) this signal.
+
+    :param calib_path: path to a ``<model>.calib.json``.
+    :param signal:     one of 'confidence', 'novelty', 'tta'.
+    :return:           reason string, or None when the block is present.
+    """
+    if not os.path.exists(calib_path):
+        return f"{os.path.basename(calib_path)} doesn't exist yet"
+    key = _SIGNAL_BLOCKS.get(signal)
+    if key is None:
+        return None
+    try:
+        calib = load_calibration(calib_path)
+    except Exception as e:
+        return f"{os.path.basename(calib_path)} could not be read ({e})"
+    if key not in calib:
+        return (f"{os.path.basename(calib_path)} has no '{key}' data "
+                f"(it was built by an older version of this toolkit)")
+    return None
+
+
+def check_model_image_size(model_path, cfg):
+    """
+    Reconcile cfg's IMAGE_W/IMAGE_H with the shape the model actually wants.
+
+    Tub frames are resized per cfg, so a model trained at a different
+    resolution than the loaded config produces a raw Keras shape-mismatch
+    error deep in a forward pass -- unreadable, and easy to hit whenever the
+    bundled template defaults are used instead of the car's own config.py.
+    The model file is the authority on its own input shape, so prefer it and
+    say loudly what happened rather than failing cryptically later.
+
+    Mutates cfg in place when they disagree. Returns (h, w) actually used.
+    """
+    # Deferred like the rest of this module's TF use, to keep import light.
+    import tensorflow as tf
+    try:
+        model = tf.keras.models.load_model(model_path, compile=False)
+        shape = model.inputs[0].shape
+        want_h, want_w = int(shape[1]), int(shape[2])
+    except Exception as e:
+        # Genuinely couldn't read a shape (odd architecture, unreadable file).
+        # Warn rather than hide it -- silently proceeding with a possibly-wrong
+        # size is what produced the unreadable downstream error in the first
+        # place.
+        logger.warning(f'Could not read input shape from {model_path} ({e}); '
+                       f'leaving IMAGE_W/IMAGE_H as configured.')
+        return (getattr(cfg, 'IMAGE_H', None), getattr(cfg, 'IMAGE_W', None))
+
+    cfg_h = getattr(cfg, 'IMAGE_H', None)
+    cfg_w = getattr(cfg, 'IMAGE_W', None)
+    if (cfg_h, cfg_w) != (want_h, want_w):
+        logger.warning(
+            f'Image size mismatch: {os.path.basename(model_path)} expects '
+            f'{want_w}x{want_h} (WxH) but the loaded config says '
+            f'{cfg_w}x{cfg_h}. Using the model\'s {want_w}x{want_h}. If that '
+            f'is wrong, point --config at the config.py this model was '
+            f'trained with.')
+        cfg.IMAGE_H = want_h
+        cfg.IMAGE_W = want_w
+    return (want_h, want_w)
+
+
 def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                        alpha=None, limit=None, percentiles=DEFAULT_PERCENTILES,
                        out_path=None, progress_callback=None, augment=None):
@@ -428,26 +510,34 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     alpha = alpha if alpha is not None \
         else getattr(cfg, 'XAI_CONFIDENCE_ALPHA', 0.2)
 
+    # Reconcile config image size with the model's own input shape BEFORE any
+    # frames are read, since records are resized per cfg.
+    check_model_image_size(model_path, cfg)
+
     logger.info(f'Loading model {model_path}')
     pilot = KerasLinear()
     pilot.load(model_path)
     part = MCDropoutConfidence(pilot, num_passes=num_passes, alpha=alpha)
 
-    # Optional TTA (test-time augmentation) stability calibration -- only when
-    # enabled, since it adds M deterministic forward passes per frame. Reuses
-    # the same loaded pilot; collects per-frame TTA steering variance below.
-    tta_enabled = getattr(cfg, 'XAI_TTA_ENABLED', False)
-    tta_part = None
-    if tta_enabled:
-        from donkeycar.parts.tta import TTAStabilityDetector
-        tta_samples = getattr(cfg, 'XAI_TTA_SAMPLES', 8)
-        tta_strength = getattr(cfg, 'XAI_TTA_STRENGTH', 0.2)
-        tta_alpha = getattr(cfg, 'XAI_TTA_ALPHA', 0.2)
-        tta_part = TTAStabilityDetector(
-            pilot, num_samples=tta_samples, alpha=tta_alpha,
-            strength=tta_strength, seed=0)
-        logger.info(f'Also collecting TTA stability stats '
-                    f'(M={tta_samples}, strength={tta_strength}).')
+    # TTA (test-time augmentation) stability calibration is built
+    # UNCONDITIONALLY, regardless of XAI_TTA_ENABLED. That config flag governs
+    # whether the signal runs live during driving; it is not a statement about
+    # what this calibration file should contain. Building the block always
+    # means a user can flip XAI_TTA_ENABLED on later and have it work
+    # immediately, instead of discovering a silently-missing block mid-drive
+    # and having to re-run this whole replay.
+    # always_measure=True is REQUIRED here: this part has no calibration yet
+    # (that's what we're building), and without the flag its run() would skip
+    # the M-pass batch and hand back 0.0 for every frame.
+    from donkeycar.parts.tta import TTAStabilityDetector
+    tta_samples = getattr(cfg, 'XAI_TTA_SAMPLES', 8)
+    tta_strength = getattr(cfg, 'XAI_TTA_STRENGTH', 0.2)
+    tta_alpha = getattr(cfg, 'XAI_TTA_ALPHA', 0.2)
+    tta_part = TTAStabilityDetector(
+        pilot, num_samples=tta_samples, alpha=tta_alpha,
+        strength=tta_strength, seed=0, always_measure=True)
+    logger.info(f'Also collecting TTA stability stats '
+                f'(M={tta_samples}, strength={tta_strength}).')
 
     # One extra, cheap deterministic sub-model reused from the same loaded
     # Keras model -- feeds the novelty-detection statistics below. A single
@@ -520,7 +610,7 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     smoothed = []
     dense2_features = []
     conv5_features = []
-    tta_variances = [] if tta_enabled else None
+    tta_variances = []
     for i, record in enumerate(records):
         img = record.image()  # uint8, already resized to model input size
         # part.run -> (angle, throttle, confidence, raw_var, smoothed_var)
@@ -558,13 +648,11 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         if progress_callback:
             progress_callback('calibrate', i + 1, len(records))
 
-    tta_kwargs = {}
-    if tta_enabled:
-        tta_kwargs = dict(
-            tta_variances=tta_variances,
-            tta_num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
-            tta_strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2),
-            tta_alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2))
+    tta_kwargs = dict(
+        tta_variances=tta_variances,
+        tta_num_samples=tta_samples,
+        tta_strength=tta_strength,
+        tta_alpha=tta_alpha)
 
     ood_kwargs = {}
     if ood_extractor is not None and ood_imgs:

@@ -463,6 +463,12 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
     model_path = os.path.expanduser(model_path)
     tub_path = os.path.expanduser(tub_path)
 
+    # Reconcile config image size with the model's own input shape BEFORE
+    # building the dataset -- records are resized per cfg, so a mismatch here
+    # surfaces later as an unreadable Keras shape error mid-forward-pass.
+    from donkeycar.parts.mc_calibrate import check_model_image_size
+    check_model_image_size(model_path, cfg)
+
     dataset = TubDataset(config=cfg, tub_paths=[tub_path])
     records = dataset.get_records()
     if start or limit:
@@ -511,6 +517,20 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             return None
         from donkeycar.parts.mc_calibrate import tta_variance_to_stability
         return tta_variance_to_stability(var, calib['tta'])
+
+    # Record WHY any signal is absent, so the viewer can say so instead of
+    # just silently omitting a line from the graph. A missing signal and a
+    # signal that happens to be flat look identical otherwise.
+    from donkeycar.parts.mc_calibrate import missing_calibration_reason
+    signals_unavailable = []
+    for key, label, signal in (('confidence', 'Confidence', 'confidence'),
+                               ('novelty_score', 'Novelty', 'novelty'),
+                               ('tta_stability', 'TTA stability', 'tta')):
+        reason = missing_calibration_reason(calib_path, signal)
+        if reason:
+            signals_unavailable.append(
+                {'key': key, 'label': label, 'reason': reason})
+            logger.info(f'{label} will not appear in the timeline: {reason}')
 
     timeline = []
     for i, (record, v) in enumerate(zip(records, variances)):
@@ -652,6 +672,7 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                  'Relative per-model signal, not a calibrated probability.'),
         'timeline': timeline,
         'frames': frames,
+        'signals_unavailable': signals_unavailable,
     }
     with open(os.path.join(out_dir, 'data.json'), 'w') as f:
         json.dump(data, f)

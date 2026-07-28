@@ -126,16 +126,25 @@ class TTAStabilityDetector:
     :param interval:         minimum seconds between updates (each an M-pass
                              batch). 0 (the default) updates every frame.
     :param seed:             optional RNG seed for reproducible augmentations.
+    :param always_measure:   when True, run the M-pass batch even without a
+                             calibration. Live driving leaves this False (an
+                             uncalibrated variance has nothing to be scored
+                             against, so paying M passes for it is waste);
+                             ``mc_calibrate`` sets it True, since measuring
+                             those variances is precisely how the calibration
+                             gets built in the first place.
     """
 
     def __init__(self, pilot, calibration_path=None, num_samples=8,
-                 alpha=0.2, strength=0.2, interval=0.0, seed=None):
+                 alpha=0.2, strength=0.2, interval=0.0, seed=None,
+                 always_measure=False):
         self.num_samples = int(num_samples)
         self.alpha = float(alpha)
         self.strength = float(strength)
         self.rng = np.random.default_rng(seed)
         self.smoothed_variance = None
         self.raw_variance = 0.0
+        self.always_measure = bool(always_measure)
 
         # Minimum seconds between M-pass updates. 0 = every frame. Held
         # frames cost nothing (no forward pass at all) -- this part never
@@ -190,7 +199,7 @@ class TTAStabilityDetector:
                 (self.smoothed_variance or 0.0)
         self.last_update_time = now
 
-        if self.calibration is not None:
+        if self.calibration is not None or self.always_measure:
             norm = normalize_image(img_arr).astype(np.float32)
             batch = photometric_batch(norm, self.num_samples, self.strength,
                                       self.rng)
@@ -200,11 +209,14 @@ class TTAStabilityDetector:
             angle_samples = np.asarray(outputs[0]).reshape(-1)
             raw_variance = float(np.var(angle_samples))
         else:
-            # No calibration to score against -- skip the M-pass batch
-            # entirely (mirrors FeatureNoveltyDetector). Nothing else
-            # consumes the raw variance without a calibration mapping, so
-            # there's no reason to pay for M forward passes just to produce
-            # a number nobody reads.
+            # No calibration to score against, and not explicitly asked to
+            # measure anyway -- skip the M-pass batch entirely (mirrors
+            # FeatureNoveltyDetector). Nothing consumes the raw variance
+            # without a calibration mapping, so there's no reason to pay for
+            # M forward passes just to produce a number nobody reads.
+            # NOTE: calibration itself MUST pass always_measure=True, or the
+            # variances it collects here would all be 0.0 and the resulting
+            # 'tta' block would be degenerate.
             raw_variance = 0.0
         self.raw_variance = raw_variance
 
