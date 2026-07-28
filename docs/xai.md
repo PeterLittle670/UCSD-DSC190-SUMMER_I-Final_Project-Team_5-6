@@ -215,6 +215,10 @@ XAI_NOVELTY_ENCODER = 'mobilenet_v2'     # 'mobilenet_v2' | 'mobilenet'
 XAI_NOVELTY_ENCODER_INPUT = 128          # square input size fed to the encoder
 XAI_NOVELTY_ENCODER_ALPHA = 1.0          # encoder width multiplier (e.g. 0.35 on a Pi)
 XAI_NOVELTY_INTERVAL = 0.3                # seconds between updates (0 = every frame, no rate-limiting)
+# Offline heat map only -- no effect while driving:
+XAI_NOVELTY_SPATIAL_INPUT = 224           # short side; grid ≈ size/32
+XAI_NOVELTY_SPATIAL_MAX_FRAMES = 400      # frames sampled to fit the map's baseline
+XAI_NOVELTY_SPATIAL_MAX_VECTORS = 4000    # cap on per-location vectors (bounds memory)
 ```
 
 </details>
@@ -304,7 +308,7 @@ The underlying statistic is **Mahalanobis distance**: instead of plain Euclidean
 
 **The interesting part of this feature is *which* features that distance is measured in — and getting it wrong the first time was a genuine, real finding.** The first implementation measured distance in the driving model's own penultimate layer (`dense_2`, 50-dimensional). This didn't work: a model trained *only* to predict steering angle has every incentive to discard anything not needed for that task — texture, color, semantic content — so grass, carpet, and even the correct dark hallway frame it was never trained on. Measuring against real training data, grass scored as *more familiar* than a legitimate on-track frame in some cases (a "grass is 90%+ confident" result that was genuinely reproduced, not a hypothetical). The fix: extract features from a **generic, frozen ImageNet-pretrained encoder** (MobileNetV2 by default, `XAI_NOVELTY_ENCODER`) instead of the task-specific steering model. A network trained on ImageNet's thousand object categories has to keep general visual information (texture, color, shape) around, so grass and track genuinely land in different regions of *that* feature space — the same math, applied to a feature space that hasn't collapsed away the information needed to tell them apart, correctly separated grass/carpet (scoring as clearly unfamiliar) from track frames.
 
-The live detector ([`donkeycar/parts/novelty.py`](../donkeycar/parts/novelty.py)) runs one extra deterministic forward pass through this encoder per update, computes the Mahalanobis distance against the calibrated Gaussian, smooths it with an EMA, and maps it to 0-100% the same way as confidence (just ascending instead of descending). The offline viewer's per-pixel novelty overlay works slightly differently and more cheaply (no extra encoder pass): it reuses the driving model's own conv features spatially, per grid location — noted as a known limitation in §2.9, since it's still measuring in the (task-collapsed) driving model's feature space rather than the fixed encoder's.
+The live detector ([`donkeycar/parts/novelty.py`](../donkeycar/parts/novelty.py)) runs one extra deterministic forward pass through this encoder per update, computes the Mahalanobis distance against the calibrated Gaussian, smooths it with an EMA, and maps it to 0-100% the same way as confidence (just ascending instead of descending). The offline viewer's per-location novelty overlay uses the very same encoder, just without its final averaging step, so the heat map and the percentage beside it are the same measurement at two resolutions. Because averaging that spatial grid reproduces the pooled vector exactly, the two cannot drift apart. It runs at a larger, aspect-preserving input (`XAI_NOVELTY_SPATIAL_INPUT`, default 224 → roughly a 7×12 grid on a 16:9 frame) since nothing offline is latency-bound.
 
 ### 2.5 Test-Time Augmentation (TTA) stability
 
@@ -342,10 +346,23 @@ This was measured directly, not just reasoned about: fitting the novelty baselin
 
 **This is scoped to novelty only** — not confidence or TTA. Both of those carry an exponential moving average over a *time-ordered* sequence of frames; splicing randomly-augmented frames into that sequence would corrupt the smoothing (a sudden synthetic shadow appearing between two real consecutive frames isn't something either signal is designed to interpret). Novelty's calibration, by contrast, is a plain unordered percentile fit over a feature distribution, so mixing in augmented samples is safe and (per the measurement above) necessary.
 
-### 2.9 Known limitations
+### 2.9 How transformations affect the signals
 
-- **The offline viewer's per-location novelty overlay is still task-collapsed.** Unlike the live novelty detector (fixed in §2.4 to use a generic ImageNet encoder), the offline spatial map reuses the driving model's own convolutional features for per-pixel positioning, since the generic encoder doesn't have a matching spatial grid to overlay against. It still shows *something* useful, but inherits the original task-collapsed weakness at a per-location level. Lower priority than the live fix since it's a secondary visualization, not the number that drives throttle scaling.
-- **`TRANSFORMATIONS` (e.g. `CROP`) are not currently replayed during calibration**, even though they always apply at both training and inference (see [augmentations.md §2.4](augmentations.md#24-known-limitations)). If your config sets `TRANSFORMATIONS`, calibration baselines may be measured on frames shaped differently from what the live model actually receives.
+`TRANSFORMATIONS` (crop, trapezoidal mask, colour-space conversion, high-pass filters) are different from augmentations in one way that matters enormously here: they apply at **both training and inference**. The model is only ever shown transformed pixels, so anything measuring the model's behaviour must be measured on transformed pixels too, or it's describing a situation that never actually occurs while driving.
+
+That creates a split, and the toolkit handles the two halves differently:
+
+- **Confidence, TTA stability, Grad-CAM, Grad-CAM++, saliency and Integrated Gradients** all get the **transformed** frame. Every one of them is a question about *your model* — how much its sub-networks disagree, how stable it is, which pixels drove its output — so they have to see the model's real input. Calibration replays tub frames through the same `TRANSFORMATIONS` pipeline training uses, in the same order (transform → augment → post-transform).
+- **Novelty gets the raw frame.** It's the odd one out because it doesn't use your steering model at all — it measures scene familiarity in a frozen ImageNet encoder (§2.4). A crop or a high-pass filter strips exactly the colour and texture content that encoder relies on, so transforming the input degrades the very thing that makes OOD detection work. "Is this scene familiar?" is a question about the world, not about the model.
+
+The magnitude here is not subtle. Measured on real frames with a modest crop (30 of 108 rows), feeding novelty the transformed frame instead of the raw one moved its score from **4.9% to 97.8%** — normal driving reading as maximally unfamiliar. Whichever input you choose, calibration and live driving must use the *same* one; the toolkit keeps them in step.
+
+A related trap: mask-style transforms like `CROP` and `TRAPEZE` blank out pixels **without changing image dimensions**. So a mismatch between calibration and driving produces no shape error and no crash — just silently wrong thresholds. That's why a calibration now records which transformations built it, and why the dashboard raises a "Calibration stale" warning if your config has drifted since.
+
+In the offline viewer, what you *see* is still the raw camera frame — overlays are computed on the transformed input the model saw, then drawn on the raw frame so the scene stays recognisable. For mask-style transforms the geometry is identical, so the heat map still lines up with the scene.
+
+### 2.10 Known limitations
+
 - **MC-Dropout's calibration percentiles are unseeded.** Calibrating the same model against the same tub twice will produce slightly different p50/p80/p97 anchors each time (a real, measured difference, not a bug) — this is expected statistical noise from the random dropout masks, so don't expect bit-identical thresholds across reruns.
 - **A generic ImageNet encoder for novelty runs on CPU today.** A Hailo-NPU-accelerated backend is a planned follow-up (to match the rest of the pipeline running on-device on hardware that has one), but isn't implemented in this toolkit yet — `CPUEncoderExtractor` ([`donkeycar/parts/ood.py`](../donkeycar/parts/ood.py)) is currently the only backend.
 - **Novelty scores saturate rather than scale gracefully at the extreme end** (§1.9) — useful for a binary "is this track or not" read, less useful for graded ranking between different kinds of out-of-distribution input.

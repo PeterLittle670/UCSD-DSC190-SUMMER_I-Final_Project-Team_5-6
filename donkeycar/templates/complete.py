@@ -497,7 +497,16 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                 kl, calibration_path=novelty_calib_path,
                 alpha=getattr(cfg, 'XAI_NOVELTY_ALPHA', 0.2),
                 interval=getattr(cfg, 'XAI_NOVELTY_INTERVAL', 0.0))
-            V.add(novelty_part, inputs=[inputs[0]],
+            # Deliberately the RAW camera frame, not inputs[0] (which becomes
+            # 'cam/image_array_trans' when TRANSFORMATIONS are configured).
+            # Novelty asks "is this scene familiar?" -- a question about the
+            # world, not about the model -- and it answers it with a frozen
+            # ImageNet encoder whose features depend on the colour/texture
+            # content that a CROP or high-pass filter throws away. Confidence
+            # and TTA below/above stay on the transformed image, since those
+            # ARE questions about the model's own behaviour. Calibration
+            # mirrors this split (see mc_calibrate.calibrate_from_tub).
+            V.add(novelty_part, inputs=['cam/image_array'],
                   outputs=['pilot/novelty', 'pilot/raw_novelty_distance',
                            'pilot/smoothed_novelty_distance'],
                   run_condition='run_pilot')
@@ -539,6 +548,22 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
                   outputs=['pilot/tta_stability', 'pilot/raw_tta_variance',
                            'pilot/smoothed_tta_variance'],
                   run_condition='run_pilot')
+
+        # A calibration can be complete yet still stale: TRANSFORMATIONS
+        # apply at inference, so adding/removing one after calibrating means
+        # every threshold was measured on different pixels than the model now
+        # sees. Mask-style transforms (CROP/TRAPEZE) keep image dimensions, so
+        # nothing errors -- this check is the only thing that surfaces it.
+        if use_mc_dropout or use_novelty or use_tta:
+            from donkeycar.parts.mc_calibrate import (default_calib_path,
+                                                      transformation_drift)
+            drift = transformation_drift(default_calib_path(model_path), cfg)
+            if drift:
+                logger.warning(f'XAI calibration may be stale: {drift}.')
+                xai_uncalibrated.append({
+                    'signal': 'transformations', 'label': 'Calibration stale',
+                    'message': f"{drift} --tub <training tub> --model "
+                               f"{model_path}"})
 
         # Push the calibration gaps found above to the dashboard (once per
         # new connection -- see WebSocketDriveAPI.open in web.py). Read from

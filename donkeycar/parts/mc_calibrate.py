@@ -33,13 +33,14 @@ Bayesian probability. A displayed "90%" means "this frame's uncertainty is low
 
 The same replay pass also fits calibration statistics for the complementary
 feature-space novelty (out-of-distribution) signal -- see
-``donkeycar.parts.novelty``: per-frame ``dense_2``/``conv2d_5`` features are
-collected alongside the variance, a diagonal Gaussian is fit to each, and
-percentile-anchored novelty-score maps are stored as ``novelty_global``/
-``novelty_spatial`` blocks in the same ``calib.json`` (purely additive --
-older calibrations without these keys still work, novelty just displays as
-unavailable). ``novelty_distance_to_score()`` is the novelty analogue of
-``variance_to_confidence()``.
+``donkeycar.parts.novelty``. Features come from a generic ImageNet encoder
+(``donkeycar.parts.ood``) run on the RAW frame, a diagonal Gaussian is fit,
+and percentile-anchored novelty-score maps are stored as ``novelty_ood``
+(pooled, drives the live %) and ``novelty_ood_spatial`` (per-location, drives
+the offline heat map) blocks in the same ``calib.json``. Both are purely
+additive -- older calibrations without these keys still work, novelty just
+displays as unavailable. ``novelty_distance_to_score()`` is the novelty
+analogue of ``variance_to_confidence()``.
 """
 import json
 import logging
@@ -83,25 +84,24 @@ _OOD_CHUNK = 256
 
 def build_calibration(smoothed_variances, num_passes, alpha,
                       percentiles=DEFAULT_PERCENTILES, model_path=None,
-                      dense2_features=None, conv5_features=None,
                       tta_variances=None, tta_num_samples=None,
                       tta_strength=None, tta_alpha=None,
                       ood_features=None, ood_encoder=None, ood_input_size=None,
                       ood_alpha=1.0, ood_encoder_file=None,
-                      augmentation_info=None):
+                      ood_spatial_features=None, ood_spatial_input_hw=None,
+                      augmentation_info=None, transformation_info=None):
     """
     Turn a collected distribution of smoothed variances into a calibration
     dict (JSON-serialisable). Optionally also fits novelty-detection
     (Mahalanobis distance) statistics from per-frame feature vectors:
 
-    :param dense2_features: optional (n_frames, 50) array of dense_2 layer
-                            outputs, one per calibration frame -- fits the
-                            *global* (whole-image) novelty statistics.
-    :param conv5_features:  optional (n_frames, h, w, 64) array of conv2d_5
-                            layer outputs -- fits the *spatial* novelty
-                            statistics, pooling every grid location across
-                            every frame into one distribution (see
-                            donkeycar.parts.novelty module docstring for the
+    :param ood_features:    optional (n_samples, feat_dim) generic-encoder
+                            features -- fits the live novelty statistics.
+    :param ood_spatial_features: optional (n_samples, feat_dim) array of
+                            PER-LOCATION generic-encoder features, pooling
+                            every grid location across every sampled frame
+                            into one distribution -- fits the offline spatial
+                            novelty map (see donkeycar.parts.novelty for the
                             position-independence trade-off).
     :param tta_variances:   optional list of per-frame test-time-augmentation
                             steering variances -- fits the ``tta`` stability
@@ -148,15 +148,14 @@ def build_calibration(smoothed_variances, num_passes, alpha,
                  'calibrated probability.'),
     }
 
-    if dense2_features is not None:
-        calib['novelty_global'] = _build_novelty_block(
-            np.asarray(dense2_features, dtype=np.float64), percentiles)
-    if conv5_features is not None:
-        conv5 = np.asarray(conv5_features, dtype=np.float64)
-        # Pool every spatial location across every frame into ONE
-        # distribution -- position-independent, see novelty.py docstring.
-        pooled = conv5.reshape(-1, conv5.shape[-1])
-        calib['novelty_spatial'] = _build_novelty_block(pooled, percentiles)
+    if ood_spatial_features is not None:
+        # Per-location generic-encoder vectors, pooled across every location
+        # and frame into ONE distribution -- position-independent, same idea
+        # as the old conv2d_5 block but in the encoder's feature space, so
+        # the offline heat map and the live novelty score finally agree.
+        calib['novelty_ood_spatial'] = _build_ood_spatial_block(
+            ood_spatial_features, ood_encoder, ood_spatial_input_hw,
+            ood_alpha, percentiles)
     if tta_variances is not None:
         calib['tta'] = _build_tta_block(
             tta_variances, tta_num_samples, tta_strength, tta_alpha,
@@ -167,6 +166,8 @@ def build_calibration(smoothed_variances, num_passes, alpha,
             ood_encoder_file, percentiles)
     if augmentation_info is not None:
         calib['augmentation'] = augmentation_info
+    if transformation_info is not None:
+        calib['transformations'] = transformation_info
 
     return calib
 
@@ -225,6 +226,28 @@ def _build_ood_block(ood_features, encoder_name, input_size, alpha,
         'alpha': float(alpha),
         'feat_dim': int(np.asarray(ood_features).shape[1]),
         'encoder_file': encoder_file,
+    })
+    return block
+
+
+def _build_ood_spatial_block(features, encoder_name, input_hw, alpha,
+                             percentiles=DEFAULT_PERCENTILES):
+    """
+    Build the OFFLINE spatial-novelty block from per-location generic-encoder
+    features. Same diagonal-Gaussian / percentile-anchor machinery as the
+    live block, plus the encoder geometry the analysis tool needs to rebuild
+    a matching extractor.
+    """
+    block = _build_novelty_block(
+        np.asarray(features, dtype=np.float64), percentiles)
+    block.update({
+        'encoder': encoder_name,
+        'input_hw': [int(input_hw[0]), int(input_hw[1])],
+        'alpha': float(alpha),
+        'feat_dim': int(np.asarray(features).shape[1]),
+        'note': ('Per-location distances in the SAME generic-encoder feature '
+                 'space as novelty_ood, measured on the RAW (untransformed) '
+                 'frame.'),
     })
     return block
 
@@ -290,8 +313,8 @@ def variance_to_confidence(variance, calib):
 def novelty_distance_to_score(distance, novelty_calib_block):
     """
     Map a Mahalanobis distance to a displayed novelty % in [min..max anchor],
-    using a novelty calibration block (calib['novelty_global'] or
-    calib['novelty_spatial']). Monotonically increasing: low distance (looks
+    using a novelty calibration block (calib['novelty_ood'] or
+    calib['novelty_ood_spatial']). Monotonically increasing: low distance (looks
     like training data) -> low novelty %, high distance -> high novelty %.
     """
     anchors = novelty_calib_block['score_anchors']
@@ -400,6 +423,45 @@ def missing_calibration_reason(calib_path, signal):
         return (f"{os.path.basename(calib_path)} has no '{key}' data "
                 f"(it was built by an older version of this toolkit)")
     return None
+
+
+def transformation_drift(calib_path, cfg):
+    """
+    Warn text if cfg's TRANSFORMATIONS no longer match what was calibrated.
+
+    TRANSFORMATIONS apply at both training and inference, so they change what
+    the model sees -- and therefore what every calibrated threshold means.
+    Adding a CROP after calibrating silently invalidates the whole file, and
+    because mask-style transforms keep image dimensions unchanged, nothing
+    errors to announce it.
+
+    Returns None when they agree, when the calibration predates this field
+    (nothing to compare against), or when the file can't be read -- a
+    missing-calibration problem is reported separately by
+    ``missing_calibration_reason``.
+    """
+    if not os.path.exists(calib_path):
+        return None
+    try:
+        calib = load_calibration(calib_path)
+    except Exception:
+        return None
+    block = calib.get('transformations')
+    if block is None:
+        return None      # older calibration; nothing recorded to compare
+    was = (list(block.get('transformations') or []),
+           list(block.get('post_transformations') or []))
+    now = (list(getattr(cfg, 'TRANSFORMATIONS', None) or []),
+           list(getattr(cfg, 'POST_TRANSFORMATIONS', None) or []))
+    if was == now:
+        return None
+    return (f"image TRANSFORMATIONS changed since calibration "
+            f"(calibrated with {was[0] or 'none'}"
+            f"{' + ' + str(was[1]) if was[1] else ''}, now running "
+            f"{now[0] or 'none'}"
+            f"{' + ' + str(now[1]) if now[1] else ''}). The model now sees "
+            f"different pixels than these thresholds were measured on -- "
+            f"re-run mc_calibrate")
 
 
 def check_model_image_size(model_path, cfg):
@@ -539,14 +601,11 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
     logger.info(f'Also collecting TTA stability stats '
                 f'(M={tta_samples}, strength={tta_strength}).')
 
-    # One extra, cheap deterministic sub-model reused from the same loaded
-    # Keras model -- feeds the novelty-detection statistics below. A single
-    # forward pass per frame (no dropout stochasticity needed: novelty is a
-    # distance-from-training-distribution measure, not an agreement measure).
-    model = pilot.interpreter.model
-    feat_model = tf.keras.Model(
-        model.inputs,
-        [model.get_layer('dense_2').output, model.get_layer('conv2d_5').output])
+    # NOTE: earlier versions also built a dense_2/conv2d_5 sub-model here to
+    # fit 'novelty_global' and 'novelty_spatial'. Both are gone: novelty is
+    # measured in a generic ImageNet encoder now (see donkeycar.parts.ood),
+    # nothing read novelty_global at all, and the spatial map has moved to
+    # that same encoder space. Dropping them removes a forward pass per frame.
 
     tub_paths = [os.path.expanduser(p) for p in tub_paths]
     dataset = TubDataset(config=cfg, tub_paths=tub_paths)
@@ -604,39 +663,60 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
                     f'({aug_list}, {aug_passes} pass(es), every '
                     f'{aug_stride} frame(s)) so shadow/low-light conditions '
                     f'the model was trained for do not read as novel.')
+    # TRANSFORMATIONS (crop, trapeze, colour-space, high-pass, ...) apply at
+    # BOTH training and inference, so the model only ever sees transformed
+    # pixels. Replaying raw tub frames here would fit every baseline to a
+    # distribution the model never actually encounters -- and because
+    # mask-style transforms (CROP/TRAPEZE) preserve image dimensions, that
+    # mismatch produces no error at all, just silently wrong thresholds.
+    # Order below mirrors BatchSequence.image_processor in pipeline/training.py
+    # exactly: transform -> augment -> post_transform.
+    from donkeycar.parts.image_transformations import ImageTransformations
+    transformation = ImageTransformations(cfg, 'TRANSFORMATIONS')
+    post_transformation = ImageTransformations(cfg, 'POST_TRANSFORMATIONS')
+    tfm_list = list(getattr(cfg, 'TRANSFORMATIONS', None) or [])
+    post_tfm_list = list(getattr(cfg, 'POST_TRANSFORMATIONS', None) or [])
+    if tfm_list or post_tfm_list:
+        logger.info(f'Applying inference transformations to the replay so the '
+                    f'baselines match what the model actually sees: '
+                    f'{tfm_list} then {post_tfm_list}.')
+
+    def to_model_input(img, apply_augmentation=False):
+        """Raw tub frame -> exactly what the model is fed, matching training."""
+        x = transformation.run(img)
+        if apply_augmentation and augmenter is not None:
+            x = augmenter.run(x)
+        return post_transformation.run(x)
+
     aug_ood_imgs = []
     n_aug_samples = 0
 
     smoothed = []
-    dense2_features = []
-    conv5_features = []
     tta_variances = []
     for i, record in enumerate(records):
-        img = record.image()  # uint8, already resized to model input size
+        img_raw = record.image()   # uint8, as recorded (pre-transformation)
+        img = to_model_input(img_raw)   # what the model is actually fed
         # part.run -> (angle, throttle, confidence, raw_var, smoothed_var)
         smooth_var = part.run(img)[4]
         smoothed.append(smooth_var)
 
-        norm = normalize_image(img).astype(np.float32)
-        dense2_out, conv5_out = feat_model(norm[np.newaxis, ...], training=False)
-        dense2_features.append(np.asarray(dense2_out)[0])
-        conv5_features.append(np.asarray(conv5_out)[0])
-
+        # The OOD encoder deliberately gets the RAW frame, not the transformed
+        # one. Novelty asks "is this scene familiar?", which is a question
+        # about the world rather than about the model -- and transformations
+        # like CROP or a high-pass filter destroy exactly the colour/texture
+        # content the ImageNet encoder relies on to answer it. Must stay in
+        # step with the live detector's input in templates/complete.py.
         if ood_extractor is not None and i % ood_stride == 0:
-            ood_imgs.append(img)
+            ood_imgs.append(img_raw)
 
         # Extra novelty samples only -- deliberately NOT fed to part.run /
         # tta_part.run, whose EMAs assume a contiguous time-ordered stream.
         if augmenter is not None and i % aug_stride == 0:
             for _ in range(aug_passes):
-                aug_img = augmenter.run(img)
-                aug_norm = normalize_image(aug_img).astype(np.float32)
-                aug_d2, aug_c5 = feat_model(aug_norm[np.newaxis, ...],
-                                            training=False)
-                dense2_features.append(np.asarray(aug_d2)[0])
-                conv5_features.append(np.asarray(aug_c5)[0])
+                # The OOD encoder gets the augmented RAW frame, matching its
+                # live input (novelty never sees transformed pixels).
                 if ood_extractor is not None:
-                    aug_ood_imgs.append(aug_img)
+                    aug_ood_imgs.append(augmenter.run(img_raw))
                 n_aug_samples += 1
 
         if tta_part is not None:
@@ -681,6 +761,55 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         except Exception as e:
             logger.warning(f'OOD feature/block build failed ({e}); skipping '
                            f'novelty_ood block.')
+
+        # Offline spatial-novelty baseline, in the SAME encoder space but
+        # keeping the per-location grid. Only the offline heat map uses this,
+        # so it can afford a bigger, aspect-preserving input than the live
+        # 128x128 square. Sampled from the clean frames already collected --
+        # no extra images held in memory.
+        try:
+            from donkeycar.parts.ood import (SpatialEncoderExtractor,
+                                             spatial_input_hw)
+            fh, fw = ood_imgs[0].shape[:2]
+            short_side = int(getattr(cfg, 'XAI_NOVELTY_SPATIAL_INPUT', 224))
+            input_hw = spatial_input_hw(fh, fw, short_side)
+            sp = SpatialEncoderExtractor(
+                getattr(cfg, 'XAI_NOVELTY_ENCODER', 'mobilenet_v2'),
+                input_hw=input_hw, alpha=ood_alpha)
+            # Cap the number of frames so this stays bounded on long tubs;
+            # every grid location of each frame becomes a training sample, so
+            # a few hundred frames already gives tens of thousands of vectors.
+            max_frames = int(getattr(cfg, 'XAI_NOVELTY_SPATIAL_MAX_FRAMES',
+                                     400))
+            step = max(1, len(ood_imgs) // max_frames)
+            sp_imgs = ood_imgs[::step][:max_frames]
+            logger.info(f'Extracting spatial OOD features from '
+                        f'{len(sp_imgs)} frames at {input_hw[0]}x'
+                        f'{input_hw[1]} (grid {sp.grid_hw})...')
+            grids = np.concatenate(
+                [sp.extract_grid_batch(sp_imgs[c:c + _OOD_CHUNK])
+                 for c in range(0, len(sp_imgs), _OOD_CHUNK)], axis=0)
+            vectors = grids.reshape(-1, grids.shape[-1])
+            # Cap the sample count before fitting. Every location of every
+            # frame is a vector, so this reaches tens of thousands quickly,
+            # and the distance computation materialises several
+            # (n_samples x feat_dim) float64 intermediates -- enough to
+            # exhaust memory on a laptop already holding TensorFlow. A
+            # diagonal Gaussian estimates each dimension independently, so a
+            # few thousand samples is statistically ample.
+            cap = int(getattr(cfg, 'XAI_NOVELTY_SPATIAL_MAX_VECTORS', 4000))
+            if len(vectors) > cap:
+                pick = np.random.default_rng(0).choice(
+                    len(vectors), size=cap, replace=False)
+                vectors = vectors[pick]
+            logger.info(f'Fitting spatial novelty baseline on {len(vectors)} '
+                        f'per-location vectors ({sp.feat_dim}-dim).')
+            ood_kwargs['ood_spatial_features'] = vectors
+            ood_kwargs['ood_spatial_input_hw'] = input_hw
+        except Exception as e:
+            logger.warning(f'Spatial OOD block build failed ({e}); the '
+                           f'offline novelty heat map will be unavailable.')
+
         if progress_callback:
             progress_callback('calibrate_ood', 1, 1)
 
@@ -693,11 +822,19 @@ def calibrate_from_tub(cfg, tub_paths, model_path, num_passes=None,
         'n_clean_samples': len(records),
         'scope': 'novelty baselines only (confidence/TTA use clean frames)',
     }
+    # Provenance so drive time can detect a config that has drifted since
+    # calibration -- e.g. a CROP added afterwards, which silently invalidates
+    # every threshold in here without changing image dimensions.
+    transformation_info = {
+        'transformations': tfm_list,
+        'post_transformations': post_tfm_list,
+        'applied_to': 'confidence, TTA and model-feature baselines',
+        'novelty_input': 'raw (untransformed) camera frame',
+    }
     calib = build_calibration(smoothed, num_passes, alpha,
                               percentiles=percentiles, model_path=model_path,
-                              dense2_features=dense2_features,
-                              conv5_features=conv5_features,
                               augmentation_info=augmentation_info,
+                              transformation_info=transformation_info,
                               **tta_kwargs, **ood_kwargs)
     out_path = out_path or default_calib_path(model_path)
     save_calibration(calib, out_path)
@@ -742,17 +879,16 @@ def _summary(calib):
         lines.append(f"      active dims     : {n_active}/{len(ood['active_dims'])}")
         lines.append(f"      distance min/max: {ds['min']:.1f} / {ds['max']:.1f}")
 
-    for key, label in (('novelty_global', 'legacy global (dense_2, 50-dim)'),
-                       ('novelty_spatial', 'offline spatial map (conv2d_5, pooled)')):
-        block = calib.get(key)
-        if not block:
-            continue
-        n_active = int(np.sum(block['active_dims']))
-        n_total = len(block['active_dims'])
-        ds = block['distance_stats']
-        lines.append(f"  novelty {label}:")
+    sp = calib.get('novelty_ood_spatial')
+    if sp:
+        n_active = int(np.sum(sp['active_dims']))
+        n_total = len(sp['active_dims'])
+        ds = sp['distance_stats']
+        hw = sp.get('input_hw', [])
+        lines.append(f"  novelty (OFFLINE map): same encoder, per-location "
+                     f"grid at {hw[0] if hw else '?'}x{hw[1] if hw else '?'}")
         lines.append(f"      active dims     : {n_active}/{n_total}")
-        lines.append(f"      distance min/max: {ds['min']:.4f} / {ds['max']:.4f}")
+        lines.append(f"      distance min/max: {ds['min']:.1f} / {ds['max']:.1f}")
 
     tta = calib.get('tta')
     if tta:

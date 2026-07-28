@@ -239,29 +239,34 @@ class GradCamUncertainty:
             mean_up = mean_up / mean_up.max()
         return mean_up, var_up, raw_peak
 
-    def novelty_map(self, img_arr, mean, var, active_dims=None, eps=1e-6):
+    def novelty_map(self, img_arr, mean, var, active_dims=None, eps=1e-6,
+                    extractor=None):
         """
-        Spatial Mahalanobis-distance "novelty" map: how far each conv2d_5
-        grid location's feature vector is from the training distribution
-        (see donkeycar.parts.novelty). Unlike attention_maps/uncertainty_map,
-        this needs no dropout stochasticity and no gradient -- a single plain
-        forward pass -- since novelty is a distance-from-training-distribution
-        measure, not an agreement measure.
+        Spatial Mahalanobis-distance "novelty" map: how far each grid
+        location's feature vector is from the training distribution (see
+        donkeycar.parts.novelty). Needs no dropout stochasticity and no
+        gradient -- a single plain forward pass -- since novelty is a
+        distance-from-training-distribution measure, not an agreement measure.
 
-        :param img_arr: uint8 [0,255] camera frame (H, W, C)
-        :param mean, var, active_dims, eps: the fitted 'novelty_spatial'
-                                            calibration block's stats (see
-                                            donkeycar.parts.mc_calibrate).
+        Features come from the GENERIC ImageNet encoder, the same space the
+        live novelty score is measured in, evaluated on the RAW frame. The
+        steering model's own conv features were used here originally, but
+        that space is task-collapsed (a network trained only to predict
+        steering discards the texture/colour that tells grass from track),
+        and it sees transformed pixels, so the heat map and the percentage
+        beside it were answering different questions.
+
+        :param img_arr:  uint8 [0,255] RAW camera frame (H, W, C)
+        :param mean, var, active_dims, eps: the fitted 'novelty_ood_spatial'
+                                            calibration block's stats.
+        :param extractor: a donkeycar.parts.ood.SpatialEncoderExtractor.
         :return: (map01, raw_peak) -- map01 is (H, W) upsampled to image
                  size and normalised to [0,1]; raw_peak is the pre-
                  normalisation peak distance (for the readout/debugging).
         """
         from donkeycar.parts.novelty import mahalanobis_diag
-        from donkeycar.utils import normalize_image
 
-        norm = normalize_image(img_arr).astype(np.float32)
-        features, _ = self.grad_model(norm[np.newaxis, ...], training=False)
-        feat = features.numpy()[0]                        # (h, w, c)
+        feat = extractor.extract_grid(img_arr)            # (gh, gw, c)
 
         dist_grid = mahalanobis_diag(feat, mean, var, active_dims, eps)
         raw_peak = float(dist_grid.max())
@@ -299,6 +304,40 @@ def overlay_heatmap(img_arr, map01, strength=0.6):
     return (out * 255).astype(np.uint8)
 
 
+def _model_input_processor(cfg):
+    """
+    Build the raw-frame -> model-input mapping for this config.
+
+    TRANSFORMATIONS (crop, trapeze, colour-space, high-pass, ...) apply at
+    both training and inference, so anything measuring the MODEL's behaviour
+    has to see transformed pixels or it is describing a network state that
+    never occurs while driving. Mask-style transforms keep image dimensions,
+    so getting this wrong produces no error -- just wrong numbers and
+    misleading heat maps. Mirrors BatchSequence.image_processor in
+    pipeline/training.py (minus the training-only augmentation step).
+
+    Returns an identity function when nothing is configured.
+    """
+    tfm = list(getattr(cfg, 'TRANSFORMATIONS', None) or [])
+    post = list(getattr(cfg, 'POST_TRANSFORMATIONS', None) or [])
+    if not tfm and not post:
+        return lambda img: img
+    from donkeycar.parts.image_transformations import ImageTransformations
+    transformation = ImageTransformations(cfg, 'TRANSFORMATIONS')
+    post_transformation = ImageTransformations(cfg, 'POST_TRANSFORMATIONS')
+    return lambda img: post_transformation.run(transformation.run(img))
+
+
+def _fit_map_to(map2d, img_arr):
+    """Resize a heat map to an image's dimensions, for the case where the
+    model input and the frame we draw on aren't the same size (e.g. a RESIZE
+    transformation). A no-op in the common mask-transform case."""
+    h, w = img_arr.shape[:2]
+    if map2d.shape[:2] == (h, w):
+        return map2d
+    return _resize_map(map2d, w, h)
+
+
 def _collect_variances(records, model_path, cfg, num_passes, alpha,
                        progress_callback=None):
     """
@@ -327,10 +366,11 @@ def _collect_variances(records, model_path, cfg, num_passes, alpha,
     pilot = KerasLinear()
     pilot.load(model_path)
     part = MCDropoutConfidence(pilot, num_passes=num_passes, alpha=alpha)
+    to_model = _model_input_processor(cfg)   # confidence probes the model
     smoothed = []
     total = len(records)
     for i, record in enumerate(records):
-        smoothed.append(part.run(record.image())[4])
+        smoothed.append(part.run(to_model(record.image()))[4])
         if (i + 1) % 200 == 0:
             logger.info(f'  {i + 1}/{total} frames')
         if progress_callback:
@@ -374,6 +414,10 @@ def _collect_novelty(records, model_path, cfg, calib, progress_callback=None):
     smoothed = []
     total = len(records)
     for i, record in enumerate(records):
+        # RAW frame on purpose -- novelty measures scene familiarity in a
+        # frozen ImageNet encoder, and TRANSFORMATIONS strip the colour and
+        # texture that encoder depends on. Matches the live wiring in
+        # templates/complete.py and the calibration in mc_calibrate.py.
         smoothed.append(part.run(record.image())[2])
         if (i + 1) % 200 == 0:
             logger.info(f'  {i + 1}/{total} frames')
@@ -416,10 +460,11 @@ def _collect_tta(records, model_path, cfg, calib, progress_callback=None):
         num_samples=getattr(cfg, 'XAI_TTA_SAMPLES', 8),
         alpha=getattr(cfg, 'XAI_TTA_ALPHA', 0.2),
         strength=getattr(cfg, 'XAI_TTA_STRENGTH', 0.2), seed=0)
+    to_model = _model_input_processor(cfg)   # TTA probes the model
     smoothed = []
     total = len(records)
     for i, record in enumerate(records):
-        smoothed.append(part.run(record.image())[2])
+        smoothed.append(part.run(to_model(record.image()))[2])
         if (i + 1) % 200 == 0:
             logger.info(f'  {i + 1}/{total} frames')
         if progress_callback:
@@ -586,32 +631,62 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
     saliency_engine = VanillaGradientSaliency(pilot.interpreter.model)
     ig_engine = IntegratedGradients(pilot.interpreter.model, steps=ig_steps)
 
-    # Spatial novelty stats, if this model's calibration has them -- computing
-    # the per-frame spatial map only needs these arrays, no extra model.
-    novelty_spatial = calib.get('novelty_spatial') if calib else None
+    # Spatial novelty stats, if this model's calibration has them. Needs the
+    # generic encoder (kept unpooled) rather than the steering model, so the
+    # heat map is measured in the same space as the novelty percentage.
+    novelty_spatial = calib.get('novelty_ood_spatial') if calib else None
+    ns_extractor = None
     if novelty_spatial is not None:
-        ns_mean = np.array(novelty_spatial['mean'])
-        ns_var = np.array(novelty_spatial['var'])
-        ns_active = np.array(novelty_spatial['active_dims'])
-        ns_eps = novelty_spatial['eps']
+        try:
+            from donkeycar.parts.ood import SpatialEncoderExtractor
+            ns_extractor = SpatialEncoderExtractor(
+                novelty_spatial.get('encoder', 'mobilenet_v2'),
+                input_hw=tuple(novelty_spatial['input_hw']),
+                alpha=novelty_spatial.get('alpha', 1.0))
+            ns_mean = np.array(novelty_spatial['mean'])
+            ns_var = np.array(novelty_spatial['var'])
+            ns_active = np.array(novelty_spatial['active_dims'])
+            ns_eps = novelty_spatial['eps']
+        except Exception as e:
+            logger.warning(f'Could not build the spatial novelty encoder '
+                           f'({e}); the novelty heat map will be skipped.')
+            novelty_spatial = None
+    elif calib is not None:
+        logger.info('No "novelty_ood_spatial" block in this calibration '
+                    '(built before the encoder-space map, or the encoder was '
+                    'unavailable); novelty heat map will be skipped.')
 
     images_dir = os.path.join(out_dir, 'images')
     os.makedirs(images_dir, exist_ok=True)
 
     frames = {}
+    to_model = _model_input_processor(cfg)
     for n, i in enumerate(sorted(selected)):
         record = records[i]
-        img = record.image()
+        # Two images per frame, on purpose:
+        #   disp  -- the raw camera frame, what a human recognises. Everything
+        #            saved to disk is drawn on this.
+        #   img   -- what the model is actually fed (transformed). Every
+        #            gradient/attribution is computed against this, or it
+        #            would be explaining behaviour on input the model never
+        #            sees while driving.
+        # Heat maps come back at img's size and are fitted to disp before
+        # overlay, which matters only if a transformation changes dimensions
+        # (mask-style CROP/TRAPEZE do not).
+        disp = record.image()
+        img = to_model(disp)
         idx = record.underlying.get('_index', i)
 
         mean_map, var_map, raw_peak = engine.uncertainty_map(img)
+        mean_map = _fit_map_to(mean_map, disp)
+        var_map = _fit_map_to(var_map, disp)
         orig_name = f'{idx:06d}_orig.jpg'
         unc_name = f'{idx:06d}_unc.png'
         attn_name = f'{idx:06d}_attn.png'
-        Image.fromarray(img).save(os.path.join(images_dir, orig_name))
-        Image.fromarray(overlay_heatmap(img, var_map)).save(
+        Image.fromarray(disp).save(os.path.join(images_dir, orig_name))
+        Image.fromarray(overlay_heatmap(disp, var_map)).save(
             os.path.join(images_dir, unc_name))
-        Image.fromarray(overlay_heatmap(img, mean_map)).save(
+        Image.fromarray(overlay_heatmap(disp, mean_map)).save(
             os.path.join(images_dir, attn_name))
 
         frame_entry = {
@@ -624,32 +699,36 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
         }
 
         # Grad-CAM++ attention (sharper, multi-region variant of 'attention').
-        attnpp_map = engine.attention_pp_map(img)
+        attnpp_map = _fit_map_to(engine.attention_pp_map(img), disp)
         attnpp_name = f'{idx:06d}_attnpp.png'
-        Image.fromarray(overlay_heatmap(img, attnpp_map)).save(
+        Image.fromarray(overlay_heatmap(disp, attnpp_map)).save(
             os.path.join(images_dir, attnpp_name))
         frame_entry['attention_pp'] = f'images/{attnpp_name}'
 
         if novelty_spatial is not None:
+            # RAW frame: novelty is measured on untransformed pixels, matching
+            # the live detector and the timeline's novelty %.
             nov_map, nov_peak = engine.novelty_map(
-                img, ns_mean, ns_var, ns_active, ns_eps)
+                disp, ns_mean, ns_var, ns_active, ns_eps,
+                extractor=ns_extractor)
+            nov_map = _fit_map_to(nov_map, disp)
             nov_name = f'{idx:06d}_novelty.png'
-            Image.fromarray(overlay_heatmap(img, nov_map)).save(
+            Image.fromarray(overlay_heatmap(disp, nov_map)).save(
                 os.path.join(images_dir, nov_name))
             frame_entry['novelty'] = f'images/{nov_name}'
             frame_entry['novelty_map_peak'] = nov_peak
 
         norm_img = normalize_image(img).astype(np.float32)
-        sal_map = saliency_engine.saliency_map(norm_img)
+        sal_map = _fit_map_to(saliency_engine.saliency_map(norm_img), disp)
         sal_name = f'{idx:06d}_saliency.png'
-        Image.fromarray(overlay_heatmap(img, sal_map)).save(
+        Image.fromarray(overlay_heatmap(disp, sal_map)).save(
             os.path.join(images_dir, sal_name))
         frame_entry['saliency'] = f'images/{sal_name}'
 
         # Integrated Gradients: cleaner, axiomatic pixel attribution.
-        ig_map = ig_engine.saliency_map(norm_img)
+        ig_map = _fit_map_to(ig_engine.saliency_map(norm_img), disp)
         ig_name = f'{idx:06d}_ig.png'
-        Image.fromarray(overlay_heatmap(img, ig_map)).save(
+        Image.fromarray(overlay_heatmap(disp, ig_map)).save(
             os.path.join(images_dir, ig_name))
         frame_entry['integrated_gradients'] = f'images/{ig_name}'
 

@@ -574,6 +574,19 @@ XAI_NOVELTY_ALPHA = 0.2       # EMA smoothing of the raw Mahalanobis distance
 XAI_NOVELTY_ENCODER = 'mobilenet_v2'   # generic feature encoder ('mobilenet_v2'|'mobilenet')
 XAI_NOVELTY_ENCODER_INPUT = 128        # square input size fed to the encoder
 XAI_NOVELTY_ENCODER_ALPHA = 1.0        # encoder width multiplier (smaller=faster, e.g. 0.35 on a Pi)
+# Offline-only: the novelty HEAT MAP in the analysis viewer uses the same
+# encoder but keeps its spatial grid, at a larger, aspect-preserving input so
+# the map isn't a coarse 4x4. Costs nothing while driving. Grid resolution is
+# roughly (short side / 32), e.g. 224 -> a 7-row grid on a 16:9 frame.
+XAI_NOVELTY_SPATIAL_INPUT = 224
+# Frames sampled to fit that map's baseline. Every grid location of every
+# sampled frame is one training vector, so a few hundred frames is plenty.
+XAI_NOVELTY_SPATIAL_MAX_FRAMES = 400
+# Hard cap on those per-location vectors before fitting. Bounds calibration
+# memory (the fit materialises several n_vectors x 1280 float64 arrays);
+# a diagonal Gaussian fits each dimension independently, so a few thousand
+# samples is already ample.
+XAI_NOVELTY_SPATIAL_MAX_VECTORS = 4000
 # Minimum seconds between novelty updates. 0 = every frame; the default below
 # (0.3) updates novelty ~3x/sec instead. Unlike confidence's interval, a held
 # frame here costs NOTHING -- this signal never drives, so between updates it

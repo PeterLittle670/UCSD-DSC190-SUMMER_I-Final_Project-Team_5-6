@@ -38,13 +38,15 @@ class TestNoveltyCalibration(unittest.TestCase):
     def setUp(self):
         rng = np.random.default_rng(7)
         variances = rng.gamma(shape=2.0, scale=0.01, size=500)
-        dense2 = rng.normal(size=(500, 50))
+        feats = rng.normal(size=(500, 64))
         self.calib = build_calibration(variances, num_passes=15, alpha=0.2,
-                                       dense2_features=dense2)
-        self.block = self.calib['novelty_global']
+                                       ood_features=feats,
+                                       ood_encoder='mobilenet_v2',
+                                       ood_input_size=128)
+        self.block = self.calib['novelty_ood']
 
     def test_novelty_block_is_built(self):
-        self.assertIn('novelty_global', self.calib)
+        self.assertIn('novelty_ood', self.calib)
 
     def test_novelty_is_monotonically_increasing_with_distance(self):
         xs = self.block['score_anchors']['distance']
@@ -59,10 +61,45 @@ class TestNoveltyCalibration(unittest.TestCase):
         self.assertAlmostEqual(below_range, 2.0, places=6)   # min-distance anchor
         self.assertAlmostEqual(above_range, 98.0, places=6)  # max-distance anchor
 
-    def test_no_dense2_features_means_no_novelty_block(self):
+    def test_no_features_means_no_novelty_blocks(self):
         rng = np.random.default_rng(8)
         variances = rng.gamma(shape=2.0, scale=0.01, size=100)
         calib = build_calibration(variances, num_passes=15, alpha=0.2)
+        self.assertNotIn('novelty_ood', calib)
+        self.assertNotIn('novelty_ood_spatial', calib)
+
+    def test_spatial_block_records_its_encoder_geometry(self):
+        # The offline heat map has to rebuild an extractor with exactly the
+        # input size it was fitted at, or the per-location distances mean
+        # nothing -- so the geometry travels with the block.
+        rng = np.random.default_rng(9)
+        variances = rng.gamma(shape=2.0, scale=0.01, size=200)
+        calib = build_calibration(variances, num_passes=15, alpha=0.2,
+                                  ood_spatial_features=rng.normal(
+                                      size=(400, 32)),
+                                  ood_encoder='mobilenet_v2',
+                                  ood_spatial_input_hw=(224, 384))
+        block = calib['novelty_ood_spatial']
+        self.assertEqual(block['input_hw'], [224, 384])
+        self.assertEqual(block['encoder'], 'mobilenet_v2')
+        self.assertEqual(block['feat_dim'], 32)
+        # and it still scores like every other novelty block
+        xs = block['score_anchors']['distance']
+        scores = [novelty_distance_to_score(d, block)
+                  for d in np.linspace(xs[0], xs[-1], 20)]
+        for a, b in zip(scores, scores[1:]):
+            self.assertLessEqual(a, b + 1e-9)
+
+    def test_legacy_task_collapsed_blocks_are_no_longer_written(self):
+        # novelty_global (dense_2) was never read by anything once novelty
+        # moved to a generic encoder, and novelty_spatial (conv2d_5) has been
+        # replaced by the encoder-space map. Neither should reappear.
+        rng = np.random.default_rng(10)
+        calib = build_calibration(rng.gamma(2.0, 0.01, 100), num_passes=15,
+                                  alpha=0.2,
+                                  ood_features=rng.normal(size=(100, 16)),
+                                  ood_encoder='mobilenet_v2',
+                                  ood_input_size=128)
         self.assertNotIn('novelty_global', calib)
         self.assertNotIn('novelty_spatial', calib)
 
@@ -144,13 +181,15 @@ class TestAugmentationProvenance(unittest.TestCase):
         rng = np.random.default_rng(31)
         variances = rng.gamma(shape=2.0, scale=0.01, size=300)
         # 300 clean frames, but 900 novelty feature vectors (clean + augmented)
-        dense2 = rng.normal(size=(900, 50))
+        feats = rng.normal(size=(900, 64))
         calib = build_calibration(variances, num_passes=15, alpha=0.2,
-                                  dense2_features=dense2,
+                                  ood_features=feats,
+                                  ood_encoder='mobilenet_v2',
+                                  ood_input_size=128,
                                   augmentation_info={'applied': True,
                                                      'n_augmented_samples': 600})
         self.assertEqual(calib['n_frames'], 300)
-        self.assertIn('novelty_global', calib)
+        self.assertIn('novelty_ood', calib)
 
 
 class TestMissingCalibrationReason(unittest.TestCase):
