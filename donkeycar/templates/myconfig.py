@@ -45,7 +45,7 @@
 # blinds the model to the far cones it steers by, and camera pitch and
 # horizon height vary across sessions.
 POST_TRANSFORMATIONS = ['CROP']
-ROI_CROP_TOP = 55       # rows masked off the top (IMAGE_H = 120)
+ROI_CROP_TOP = 45
 ROI_CROP_BOTTOM = 0
 ROI_CROP_LEFT = 0
 ROI_CROP_RIGHT = 0
