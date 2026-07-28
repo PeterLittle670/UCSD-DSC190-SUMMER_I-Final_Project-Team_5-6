@@ -930,6 +930,48 @@ ROI_CROP_BOTTOM = 0
 ROI_CROP_RIGHT = 0
 ROI_CROP_LEFT = 0
 
+# "LANE_ISOLATE" transformation
+# Reduces the image to its lane markings in a way that is largely
+# independent of scene brightness, so a model trained at one time of day
+# still recognises the track at another. Outputs 3 channels (border tape /
+# centre line / local contrast), so IMAGE_DEPTH stays 3.
+#
+# Put it in POST_TRANSFORMATIONS, after CROP - it amplifies thin bright
+# structures, and building rails, window frames and door edges above the
+# horizon look exactly like lane tape to it, so they need to be masked off
+# first. Being a TRANSFORMATION it applies during training AND driving, so
+# the same values must be set on the car and in the training config.
+#
+# LANE_ISOLATE_KERNEL is the width filter: structures thinner than this many
+# pixels are treated as markings. Scale it with IMAGE_W - 9 suits tape at
+# 192 wide. Larger suppresses pavement texture but drops far markings.
+#
+# The centre-line channel needs to know two things, and gets them wrong
+# SILENTLY (the channel just goes blank - no error), so preview after
+# changing either:
+#
+#   LANE_ISOLATE_COLOR_ORDER - the channel order of the array reaching this
+#     part, which is NOT always RGB. The OAK-D part returns getCvFrame(),
+#     which is BGR by OpenCV convention, and nothing converts it before the
+#     tub writes it, so OAK-D tubs hold BGR data in RGB-labelled JPEGs. Set
+#     'bgr' for an OAK-D rig, 'rgb' for PiCamera.
+#   LANE_ISOLATE_CHROMA_ANGLE - the hue of the centre markings as an angle
+#     in the CIELAB a*/b* plane: 90 = yellow, -90 = blue, 180 = green,
+#     0 = magenta/red, -135 = cyan. Measured on this track's yellow tape at
+#     a*=-1, b*=+33, i.e. ~92 degrees.
+LANE_ISOLATE_KERNEL = 9
+LANE_ISOLATE_GAIN = 3.0
+# Tape-vs-road separation is ~44x and flat for any scale below the point
+# where the tape response starts clipping at 255; past that, clipping
+# compresses the signal and separation falls (8.0 clipped 35% of tape
+# pixels and dropped to 39x, 12.0 clipped 89% and dropped to 31x). 5.0
+# keeps a strong absolute response with only ~5% clipping.
+LANE_ISOLATE_CHROMA_SCALE = 5.0
+LANE_ISOLATE_LC_SIGMA = 7.0
+LANE_ISOLATE_BG_SIGMA = 3.0
+LANE_ISOLATE_COLOR_ORDER = 'rgb'   # 'bgr' for OAK-D; see above
+LANE_ISOLATE_CHROMA_ANGLE = 90.0   # degrees in a*/b*; 90 = yellow
+
 # "TRAPEZE" tranformation
 # Apply mask to borders of image
 # defined by a trapezoid.

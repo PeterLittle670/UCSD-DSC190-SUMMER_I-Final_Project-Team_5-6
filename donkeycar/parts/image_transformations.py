@@ -96,6 +96,17 @@ def image_transformer(name: str, config):
         return cv_parts.ImgCanny(config.CANNY_LOW_THRESHOLD,
                                  config.CANNY_HIGH_THRESHOLD,
                                  config.CANNY_APERTURE)
+    elif "LANE_ISOLATE" == name:
+        # illumination-invariant lane marking extraction. getattr rather
+        # than direct access so a config predating these keys still loads.
+        return cv_parts.ImgLaneIsolate(
+            getattr(config, 'LANE_ISOLATE_KERNEL', 9),
+            getattr(config, 'LANE_ISOLATE_GAIN', 3.0),
+            getattr(config, 'LANE_ISOLATE_CHROMA_SCALE', 8.0),
+            getattr(config, 'LANE_ISOLATE_LC_SIGMA', 7.0),
+            getattr(config, 'LANE_ISOLATE_BG_SIGMA', 3.0),
+            getattr(config, 'LANE_ISOLATE_COLOR_ORDER', 'rgb'),
+            getattr(config, 'LANE_ISOLATE_CHROMA_ANGLE', 90.0))
     # 
     # blur transformations
     #
@@ -305,6 +316,8 @@ def img_transform_from_json(transform_config):
     elif "CANNY" == transformation:
         # canny edge detection
         transformer = cv_parts.ImgCanny(**args)
+    elif "LANE_ISOLATE" == transformation:
+        transformer = cv_parts.ImgLaneIsolate(**(args or {}))
     # 
     # blur transformations
     #
