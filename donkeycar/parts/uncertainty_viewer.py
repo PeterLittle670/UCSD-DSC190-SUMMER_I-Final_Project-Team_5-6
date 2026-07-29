@@ -36,6 +36,7 @@ Usage:
 Then open http://localhost:8890 in a browser.
 """
 import argparse
+import copy
 import json
 import logging
 import os
@@ -144,6 +145,30 @@ class LauncherState:
             logger.debug(f'training_tubs_for_model({model_path}) failed: {e}')
             return None
 
+    def saved_pipeline_for_model(self, model_path):
+        """
+        Read `model_path`'s ``.preprocessing.json`` sidecar (written by
+        training, see ``image_transformations.save_preprocessing_metadata``)
+        and return its recorded pipeline, so the form can show what a model
+        actually expects before the user decides whether to accept this
+        launcher's config or type an override. Returns None if no sidecar
+        exists (e.g. a model trained before this tracking existed).
+        """
+        from donkeycar.parts.image_transformations import _sidecar_path_for
+        sidecar_path = _sidecar_path_for(os.path.expanduser(model_path))
+        if not os.path.isfile(sidecar_path):
+            return None
+        try:
+            with open(sidecar_path) as f:
+                saved = json.load(f)
+        except Exception as e:
+            logger.debug(f'saved_pipeline_for_model({model_path}) failed: {e}')
+            return None
+        return {
+            'pipeline_steps': saved.get('pipeline_steps'),
+            'lane_isolate_params': saved.get('lane_isolate_params'),
+        }
+
     def start(self, form):
         with self._lock:
             if self._progress['running']:
@@ -166,6 +191,33 @@ class LauncherState:
 
             def cb(stage, current, total):
                 self._set(stage=stage, current=current, total=total)
+
+            # This server's cfg is fixed at startup (from --config), so it
+            # was almost never trained alongside every model the form could
+            # point at -- it's the wrong pipeline for any model that used a
+            # different one. A comma-separated override in the form lets the
+            # user say "use THIS pipeline for this run" instead of restarting
+            # the whole launcher with a different --config per model.
+            # Applied to POST_TRANSFORMATIONS, matching how this project
+            # actually uses these settings (see myconfig.py: TRANSFORMATIONS
+            # stays empty, everything - CROP, LANE_ISOLATE - goes in
+            # POST_TRANSFORMATIONS). copy.copy() so the override never leaks
+            # into self.cfg and affect a later run that doesn't ask for it.
+            override_raw = (form.get('transformations_override') or '').strip()
+            if override_raw:
+                override_steps = [s.strip().upper() for s in
+                                  override_raw.split(',') if s.strip()]
+                run_cfg = copy.copy(self.cfg)
+                run_cfg.POST_TRANSFORMATIONS = override_steps
+                verify_preprocessing = False
+                logger.info(
+                    f'Transformations override from the form: '
+                    f'POST_TRANSFORMATIONS={override_steps} for this run '
+                    f'only. Skipping the saved-pipeline check since this is '
+                    f'an explicit override.')
+            else:
+                run_cfg = self.cfg
+                verify_preprocessing = True
 
             from donkeycar.parts.mc_calibrate import (default_calib_path,
                                                       calibrate_from_tub,
@@ -200,7 +252,7 @@ class LauncherState:
                                 f'auto-calibrating against the user-specified '
                                 f'tub(s): {calib_tubs}')
                 else:
-                    training_tubs = find_training_tubs(self.cfg, model)
+                    training_tubs = find_training_tubs(run_cfg, model)
                     if training_tubs:
                         calib_tubs = training_tubs
                         logger.info(f'No calibration at {calib_path}; '
@@ -221,7 +273,13 @@ class LauncherState:
                         logger.warning(warning)
                         self._set(calibration_warning=warning)
                 try:
-                    calibrate_from_tub(self.cfg, calib_tubs, model,
+                    # Calibration replays training-tub frames through
+                    # TRANSFORMATIONS/POST_TRANSFORMATIONS too (it needs to
+                    # see what the model actually sees), so it must use the
+                    # same run_cfg as the analysis below - otherwise the
+                    # baseline and the analysis would be built from two
+                    # different pipelines, corrupting the novelty stats.
+                    calibrate_from_tub(run_cfg, calib_tubs, model,
                                        progress_callback=cb)
                 except Exception as e:
                     # Surfaced to the UI (not just logged) -- a bad tub path
@@ -235,10 +293,11 @@ class LauncherState:
 
             from donkeycar.parts.gradcam_uncertainty import analyze_tub
             analyze_tub(
-                self.cfg, tub, model, out_dir,
-                num_passes=getattr(self.cfg, 'XAI_CONFIDENCE_PASSES', 15),
-                alpha=getattr(self.cfg, 'XAI_CONFIDENCE_ALPHA', 0.2),
-                ig_steps=getattr(self.cfg, 'XAI_IG_STEPS', 32),
+                run_cfg, tub, model, out_dir,
+                num_passes=getattr(run_cfg, 'XAI_CONFIDENCE_PASSES', 15),
+                alpha=getattr(run_cfg, 'XAI_CONFIDENCE_ALPHA', 0.2),
+                ig_steps=getattr(run_cfg, 'XAI_IG_STEPS', 32),
+                verify_preprocessing=verify_preprocessing,
                 top_k=int(form['value']) if mode == 'top_k'
                       and form.get('value') else 50,
                 percentile=float(form['value']) if mode == 'percentile'
@@ -338,6 +397,15 @@ class ViewerHandler(SimpleHTTPRequestHandler):
                 return self._send_json({'error': 'no model given'}, status=400)
             tubs = ViewerHandler.launcher_state.training_tubs_for_model(model)
             return self._send_json({'tubs': tubs})
+
+        if path == '/api/model_info':
+            if ViewerHandler.launcher_state is None:
+                return self.send_error(404)
+            model = parse_qs(query).get('model', [''])[0]
+            if not model:
+                return self._send_json({'error': 'no model given'}, status=400)
+            info = ViewerHandler.launcher_state.saved_pipeline_for_model(model)
+            return self._send_json(info or {'pipeline_steps': None})
 
         if path.startswith('/tub/'):
             if not self.tub_images_dir:

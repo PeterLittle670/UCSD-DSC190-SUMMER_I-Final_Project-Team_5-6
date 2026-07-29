@@ -184,3 +184,65 @@ class TestPreprocessingMetadata:
         model_path = str(tmp_path / 'never_trained.h5')
         # no sidecar file written at all
         check_preprocessing_metadata(cfg, model_path)  # must not raise
+
+    def test_pipeline_steps_reflects_lane_isolate(self):
+        cfg = self.crop_cfg()
+        cfg.POST_TRANSFORMATIONS = ['CROP', 'LANE_ISOLATE']
+        cfg.LANE_ISOLATE_COLOR_ORDER = 'bgr'
+        meta = build_preprocessing_metadata(cfg)
+        assert meta['pipeline_steps'] == ['CROP', 'LANE_ISOLATE']
+        assert meta['lane_isolate_params']['color_order'] == 'bgr'
+
+    def test_detects_lane_isolate_param_mismatch_with_same_step_list(
+            self, tmp_path):
+        # Same pipeline_steps on both sides (CROP + LANE_ISOLATE), only a
+        # LANE_ISOLATE_* parameter differs - this is exactly the class of bug
+        # (e.g. wrong LANE_ISOLATE_COLOR_ORDER) that step-name-only tracking
+        # can't catch, so it must be caught via lane_isolate_params instead.
+        cfg = self.crop_cfg()
+        cfg.POST_TRANSFORMATIONS = ['CROP', 'LANE_ISOLATE']
+        cfg.LANE_ISOLATE_COLOR_ORDER = 'bgr'
+        model_path = str(tmp_path / 'mypilot.h5')
+        with open(model_path, 'w') as f:
+            f.write('placeholder')
+        save_preprocessing_metadata(cfg, model_path)
+
+        drifted_cfg = self.crop_cfg()
+        drifted_cfg.POST_TRANSFORMATIONS = ['CROP', 'LANE_ISOLATE']
+        drifted_cfg.LANE_ISOLATE_COLOR_ORDER = 'rgb'  # wrong for this rig
+        with pytest.raises(RuntimeError, match='lane_isolate_params'):
+            check_preprocessing_metadata(drifted_cfg, model_path)
+
+    def test_legacy_sidecar_missing_new_fields_does_not_false_positive(
+            self, tmp_path):
+        # A sidecar saved before pipeline_steps/lane_isolate_params existed
+        # (simulated here by stripping those keys) must not be treated as a
+        # mismatch just because it lacks fields it predates - only fields it
+        # actually recorded should ever be compared.
+        cfg = self.crop_cfg()
+        model_path = str(tmp_path / 'mypilot.h5')
+        with open(model_path, 'w') as f:
+            f.write('placeholder')
+        save_preprocessing_metadata(cfg, model_path)
+
+        sidecar_path = str(tmp_path / 'mypilot.preprocessing.json')
+        with open(sidecar_path) as f:
+            saved = json.load(f)
+        del saved['pipeline_steps']
+        with open(sidecar_path, 'w') as f:
+            json.dump(saved, f)
+
+        check_preprocessing_metadata(cfg, model_path)  # must not raise
+
+    def test_context_appears_in_mismatch_message(self, tmp_path):
+        cfg = self.crop_cfg()
+        model_path = str(tmp_path / 'mypilot.h5')
+        with open(model_path, 'w') as f:
+            f.write('placeholder')
+        save_preprocessing_metadata(cfg, model_path)
+
+        drifted_cfg = self.crop_cfg()
+        drifted_cfg.ROI_CROP_TOP = 30
+        with pytest.raises(RuntimeError, match="analysis's config"):
+            check_preprocessing_metadata(
+                drifted_cfg, model_path, context="this analysis's config")

@@ -80,6 +80,23 @@
     <label for="model">Model path</label>
     <input type="text" id="model" list="models-list" placeholder="models/mypilot.h5">
     <datalist id="models-list"></datalist>
+    <div class="hint" id="model-pipeline-hint"></div>
+
+    <label for="transformations-override">Transformations override (optional)</label>
+    <input type="text" id="transformations-override"
+           placeholder="e.g. CROP, LANE_ISOLATE -- leave blank to use this launcher's config">
+    <div class="hint" id="transformations-override-hint">This launcher was
+      started with one fixed config, but every model above may have been
+      trained with a DIFFERENT TRANSFORMATIONS/POST_TRANSFORMATIONS pipeline
+      -- nothing here connects a model file back to the config it needs, so
+      analysing it with the wrong one silently computes every heat map on
+      pixels the model never saw. By default this is caught for you: the run
+      is refused if it doesn't match the model's saved training pipeline
+      (shown above once you pick a model). Only fill this in to deliberately
+      analyse a model under a DIFFERENT pipeline than it was trained with
+      (an intentional what-if) -- doing so replaces POST_TRANSFORMATIONS for
+      this run only and skips that check, since you're now doing it on
+      purpose.</div>
 
     <label>Frames to analyse</label>
     <div class="radio-row">
@@ -217,6 +234,38 @@
   $('model').addEventListener('change', refreshTrainingTubs);
   $('model').addEventListener('blur', refreshTrainingTubs);
 
+  // ---- model field: show the pipeline this model was actually trained
+  // with (from its .preprocessing.json sidecar), so it's visible before
+  // deciding whether an override is needed at all. ----------------------
+  function describeLaneIsolate(p) {
+    if (!p) return '';
+    return ' (kernel=' + p.kernel + ', color_order=' + p.color_order +
+      ', chroma_angle=' + p.chroma_angle + ')';
+  }
+  function refreshModelPipeline() {
+    const model = $('model').value.trim();
+    const hint = $('model-pipeline-hint');
+    if (!model) { hint.textContent = ''; return; }
+    fetch('/api/model_info?model=' + encodeURIComponent(model))
+      .then(r => r.json())
+      .then(d => {
+        if (d.pipeline_steps && d.pipeline_steps.length) {
+          hint.textContent = 'Trained with: ' + d.pipeline_steps.join(', ') +
+            describeLaneIsolate(d.lane_isolate_params);
+        } else if (d.pipeline_steps === null) {
+          hint.textContent = 'No preprocessing record for this model (older '
+            + 'model, or none was ever saved) -- cannot verify the '
+            + 'transformations pipeline automatically for it.';
+        } else {
+          hint.textContent = 'Trained with no TRANSFORMATIONS/'
+            + 'POST_TRANSFORMATIONS (raw camera frames).';
+        }
+      })
+      .catch(() => { hint.textContent = ''; });
+  }
+  $('model').addEventListener('change', refreshModelPipeline);
+  $('model').addEventListener('blur', refreshModelPipeline);
+
   // Returns null (meaning: don't state a range at all) until a tub has been
   // entered AND its frame count successfully resolved -- showing a fake
   // "1-total frames" placeholder before then reads as a real constraint.
@@ -344,6 +393,7 @@
       export_frames: $('export-frames').checked,
       auto_calibrate: $('auto-calibrate').checked,
       calib_tub: $('calib-tub').value.trim(),
+      transformations_override: $('transformations-override').value.trim(),
     };
 
     $('run-btn').disabled = true;

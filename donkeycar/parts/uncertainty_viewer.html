@@ -115,9 +115,11 @@
           <option value="saliency">Exact pixels that mattered (saliency)</option>
           <option value="integrated_gradients">Exact pixels that mattered, cleaner (integrated gradients)</option>
           <option value="orig">Just the camera</option>
+          <option value="model_input">What the model actually sees (transformed)</option>
         </select>
       </label>
       <label><input type="checkbox" id="analyzed-only"> analysed frames only</label>
+      <label id="draw-on-mi-wrap" style="display:none"><input type="checkbox" id="draw-on-mi"> draw on model input</label>
     </div>
     <div id="layer-explain"></div>
     <input type="range" id="scrub" min="0" max="0" value="0" step="1">
@@ -174,7 +176,8 @@
         playBtn = $('play'), fpsSel = $('fps'), layerSel = $('layer'),
         analyzedOnly = $('analyzed-only'), readout = $('readout'),
         canvas = $('graph'), layerExplain = $('layer-explain'),
-        glossaryBtn = $('glossary-btn'), glossary = $('glossary');
+        glossaryBtn = $('glossary-btn'), glossary = $('glossary'),
+        drawOnMi = $('draw-on-mi'), drawOnMiWrap = $('draw-on-mi-wrap');
 
   // Plain-language explanation for whichever layer is currently selected,
   // technical name kept alongside rather than removed -- same information for
@@ -224,6 +227,15 @@
       term: 'Just the camera', tech: '',
       text: 'No AI overlay -- the plain camera frame, for reference against ' +
             'the layers above.'
+    },
+    model_input: {
+      term: 'What the model actually sees', tech: 'TRANSFORMATIONS applied',
+      text: 'The camera frame after the configured TRANSFORMATIONS / ' +
+            'POST_TRANSFORMATIONS (crop, resize, lane isolation, colour ' +
+            'conversion). This -- not the plain camera frame -- is the input ' +
+            'every heat map above is computed against, so if it looks wrong ' +
+            'here the model is genuinely being fed something wrong. Only ' +
+            'present when the pipeline actually changes the image.'
     },
   };
 
@@ -276,6 +288,13 @@
     timeline.forEach((e, i) => {
       if (d.frames && d.frames[String(e.index)]) analyzedPos.push(i);
     });
+
+    // Only offer the model-input toggle when the transformation pipeline
+    // actually changed the geometry -- otherwise the two overlay variants
+    // would be identical and the checkbox would be a no-op.
+    if (drawOnMiWrap && d.model_input_available) {
+      drawOnMiWrap.style.display = '';
+    }
 
     series = SERIES_DEFS
       .filter(s => timeline.some(e => e[s.key] !== null && e[s.key] !== undefined))
@@ -342,8 +361,20 @@
     const f = data.frames && data.frames[String(entry.index)];
     if (f) {
       const layer = layerSel.value;
+      // When 'draw on model input' is ticked, prefer the '_mi' variant of
+      // whichever heat map is selected. Those are drawn straight onto the
+      // transformed image, so they need no crop mapping and are exact by
+      // construction; the default variants are projected back onto the raw
+      // frame instead. Novelty has no _mi variant on purpose -- it is
+      // measured on raw pixels, so it is already in raw coordinates.
+      if (drawOnMi && drawOnMi.checked && f[layer + '_mi']) {
+        return f[layer + '_mi'];
+      }
       if (layer === 'attention') return f.attention;
       if (layer === 'orig') return f.orig;
+      // absent when the pipeline is a no-op (nothing to show that the
+      // 'orig' layer doesn't already show) or on older analyses.
+      if (layer === 'model_input') return f.model_input || null;
       // attention++ / IG maps may be absent on analyses produced before those
       // layers existed -- fall through to unavailable rather than the overlay.
       if (layer === 'attention_pp') return f.attention_pp || null;
@@ -437,6 +468,7 @@
   playBtn.addEventListener('click', () => timer ? pause() : play());
   fpsSel.addEventListener('change', () => { if (timer) { pause(); play(); } });
   layerSel.addEventListener('change', () => seek(pos));
+  if (drawOnMi) drawOnMi.addEventListener('change', () => seek(pos));
   scrub.addEventListener('input', () => seek(parseInt(scrub.value, 10)));
   document.addEventListener('keydown', e => {
     if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;

@@ -72,12 +72,14 @@ def log_preprocessing_config(cfg, context: str, include_augmentations=False):
 def build_preprocessing_metadata(cfg) -> dict:
     """
     Snapshot of the preprocessing settings that must be identical between
-    training and driving. Used both as the sidecar json saved next to a
-    trained model and as the "current config" side of the comparison done
-    by check_preprocessing_metadata() before the vehicle starts driving.
+    training and driving (or, for gradcam_uncertainty.py, training and
+    offline analysis). Used both as the sidecar json saved next to a trained
+    model and as the "current config" side of the comparison done by
+    check_preprocessing_metadata().
     """
-    crop_active = 'CROP' in _pipeline_steps(cfg, include_augmentations=False)
-    return {
+    steps = _pipeline_steps(cfg, include_augmentations=False)
+    crop_active = 'CROP' in steps
+    meta = {
         "image_width": getattr(cfg, 'IMAGE_W', None),
         "image_height": getattr(cfg, 'IMAGE_H', None),
         "transformations": ["CROP_RESIZE"] if crop_active else [],
@@ -93,7 +95,29 @@ def build_preprocessing_metadata(cfg) -> dict:
         "resize_width": getattr(cfg, 'IMAGE_W', None),
         "resize_height": getattr(cfg, 'IMAGE_H', None),
         "crop_mode": "physical_crop_and_resize" if crop_active else "none",
+        # The fields above only ever distinguish "CROP or not" - they predate
+        # LANE_ISOLATE, CANNY, colour-space conversions, TRAPEZE, etc. and
+        # can't tell those apart, or catch a step LIST changing (e.g. CROP
+        # alone vs CROP+LANE_ISOLATE - both have crop_active=True above).
+        # pipeline_steps is the actual ordered TRANSFORMATIONS +
+        # POST_TRANSFORMATIONS list, so any such change is caught too.
+        "pipeline_steps": steps,
     }
+    if 'LANE_ISOLATE' in steps:
+        # Same step name, different numbers is a real failure mode here -
+        # e.g. LANE_ISOLATE_COLOR_ORDER wrong silently floods or blanks the
+        # centre-line channel rather than erroring - so these are compared
+        # too, not just whether LANE_ISOLATE is present.
+        meta["lane_isolate_params"] = {
+            "kernel": getattr(cfg, 'LANE_ISOLATE_KERNEL', 9),
+            "gain": getattr(cfg, 'LANE_ISOLATE_GAIN', 3.0),
+            "chroma_scale": getattr(cfg, 'LANE_ISOLATE_CHROMA_SCALE', 8.0),
+            "lc_sigma": getattr(cfg, 'LANE_ISOLATE_LC_SIGMA', 7.0),
+            "bg_sigma": getattr(cfg, 'LANE_ISOLATE_BG_SIGMA', 3.0),
+            "color_order": getattr(cfg, 'LANE_ISOLATE_COLOR_ORDER', 'rgb'),
+            "chroma_angle": getattr(cfg, 'LANE_ISOLATE_CHROMA_ANGLE', 90.0),
+        }
+    return meta
 
 
 def _sidecar_path_for(model_path: str) -> str:
@@ -111,20 +135,25 @@ def save_preprocessing_metadata(cfg, model_path: str) -> str:
     return sidecar_path
 
 
-def check_preprocessing_metadata(cfg, model_path: str) -> None:
+def check_preprocessing_metadata(cfg, model_path: str,
+                                 context: str = "vehicle") -> None:
     """
-    Compare model_path's preprocessing sidecar (if any) against the current
-    vehicle config. Raises RuntimeError describing every mismatched field if
-    any differ, so a stale/mismatched crop or resolution setting stops the
-    vehicle from starting instead of silently driving badly. If no sidecar
-    exists (e.g. a model trained before this check existed), this only logs
-    a warning and continues.
+    Compare model_path's preprocessing sidecar (if any) against the given
+    config. Raises RuntimeError describing every mismatched field if any
+    differ, so a stale/mismatched crop, LANE_ISOLATE setting or resolution
+    stops whatever is about to consume the model instead of silently
+    producing wrong output. If no sidecar exists (e.g. a model trained
+    before this check existed), this only logs a warning and continues.
+
+    :param context: how to describe the caller in the error/warning text -
+        "vehicle" (default, for drive-time use) or e.g. "this analysis's
+        config" for gradcam_uncertainty.py. Purely cosmetic.
     """
     sidecar_path = _sidecar_path_for(model_path)
     if not os.path.exists(sidecar_path):
         logger.warning(
             f"No preprocessing metadata found at {sidecar_path} - cannot "
-            f"verify that {model_path} matches this vehicle's TRANSFORMATIONS"
+            f"verify that {model_path} matches {context}'s TRANSFORMATIONS"
             f"/POST_TRANSFORMATIONS/ROI_CROP_* configuration.")
         return
 
@@ -132,19 +161,31 @@ def check_preprocessing_metadata(cfg, model_path: str) -> None:
         saved = json.load(f)
     current = build_preprocessing_metadata(cfg)
 
+    # Only enforce fields the sidecar actually recorded. Keys can be added to
+    # build_preprocessing_metadata() over time (pipeline_steps and
+    # lane_isolate_params both postdate the original schema) - a sidecar
+    # written before that addition simply never captured it, which is not
+    # evidence of a real mismatch, so it must not be treated as one.
+    unverifiable = [key for key in current if key not in saved]
+    if unverifiable:
+        logger.warning(
+            f"{sidecar_path} predates tracking {unverifiable} - cannot "
+            f"verify {'those fields' if len(unverifiable) > 1 else 'that field'} "
+            f"match {context}. Retrain to refresh the sidecar and get full "
+            f"verification.")
+
     mismatches = [
         f"  {key}: model was trained with {saved.get(key)!r}, "
-        f"current vehicle config has {current.get(key)!r}"
-        for key in current if saved.get(key) != current.get(key)
+        f"current {context} has {current.get(key)!r}"
+        for key in current if key in saved and saved.get(key) != current.get(key)
     ]
     if mismatches:
         raise RuntimeError(
             "Preprocessing mismatch between the trained model "
-            f"({sidecar_path}) and this vehicle's configuration:\n" +
+            f"({sidecar_path}) and {context}:\n" +
             "\n".join(mismatches) +
-            "\nRefusing to start - retrain the model with this vehicle's "
-            "configuration, or update the vehicle's config to match the "
-            "model.")
+            f"\nRefusing to proceed - retrain the model with {context}, "
+            f"or update {context} to match the model.")
 
 
 def image_transformer(name: str, config):

@@ -328,6 +328,41 @@ def _model_input_processor(cfg):
     return lambda img: post_transformation.run(transformation.run(img))
 
 
+def _model_input_differs(img, disp):
+    """True if the transformation pipeline actually changed the pixels, so
+    an unchanged pipeline doesn't double every frame on disk for nothing."""
+    if img is None or disp is None:
+        return False
+    if img.shape != disp.shape:
+        return True
+    return not np.array_equal(img, disp)
+
+
+def _as_displayable(img):
+    """Coerce a model input to something a browser can render as a jpg.
+
+    Transformations are free to emit shapes a viewer can't show directly:
+    single-channel (RGB2GRAY), or 3 channels that aren't colour at all
+    (LANE_ISOLATE emits tape / centre-line / local-contrast). Those are
+    displayed as-is rather than being interpreted as RGB, which is the
+    honest thing to show -- it IS what the network receives.
+    """
+    arr = np.asarray(img)
+    if arr.dtype != np.uint8:
+        finite = np.isfinite(arr)
+        lo = float(arr[finite].min()) if finite.any() else 0.0
+        hi = float(arr[finite].max()) if finite.any() else 1.0
+        span = max(hi - lo, 1e-6)
+        arr = np.clip((arr - lo) / span * 255.0, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        return np.dstack([arr] * 3)
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        return np.dstack([arr[:, :, 0]] * 3)
+    if arr.ndim == 3 and arr.shape[2] > 3:
+        return arr[:, :, :3]
+    return arr
+
+
 def _fit_map_to(map2d, img_arr):
     """Resize a heat map to an image's dimensions, for the case where the
     model input and the frame we draw on aren't the same size (e.g. a RESIZE
@@ -336,6 +371,80 @@ def _fit_map_to(map2d, img_arr):
     if map2d.shape[:2] == (h, w):
         return map2d
     return _resize_map(map2d, w, h)
+
+
+def _crop_geometry(cfg, raw_shape, model_shape):
+    """
+    Work out which region of the raw frame the model input corresponds to.
+
+    Needed because CROP is ImgCropResize: it physically deletes rows and
+    resizes what's left back to IMAGE_H/IMAGE_W, so the model input ends up
+    the SAME SIZE as the raw frame while showing a different part of the
+    scene. Heat maps come back in model-input coordinates, and drawing them
+    straight onto the raw frame silently puts every hot spot in the wrong
+    place - _fit_map_to() can't catch it, because the shapes match.
+
+    Returns (top, bottom, left, right) in raw-frame pixels, or None when the
+    pipeline isn't doing anything geometric (in which case the plain resize
+    in _fit_map_to is already correct).
+    """
+    steps = list(getattr(cfg, 'TRANSFORMATIONS', None) or []) + \
+        list(getattr(cfg, 'POST_TRANSFORMATIONS', None) or [])
+    if 'CROP' not in steps:
+        return None
+
+    raw_h, raw_w = raw_shape[:2]
+    top = int(getattr(cfg, 'ROI_CROP_TOP', 0) or 0)
+    bottom = int(getattr(cfg, 'ROI_CROP_BOTTOM', 0) or 0)
+    left = int(getattr(cfg, 'ROI_CROP_LEFT', 0) or 0)
+    right = int(getattr(cfg, 'ROI_CROP_RIGHT', 0) or 0)
+    if not (top or bottom or left or right):
+        return None
+
+    kept = (raw_h - top - bottom, raw_w - left - right)
+    if min(kept) <= 0:
+        return None
+
+    model_hw = tuple(model_shape[:2])
+    target = (int(getattr(cfg, 'IMAGE_H', 0) or 0),
+              int(getattr(cfg, 'IMAGE_W', 0) or 0))
+    # Either the crop was resized back to IMAGE_H/IMAGE_W, or it wasn't
+    # resized at all. Anything else means some other transform is also
+    # changing geometry and this simple inverse would be a guess.
+    if model_hw not in (target, kept):
+        logger.warning(
+            f'Model input {model_hw} matches neither the cropped region '
+            f'{kept} nor IMAGE_H/IMAGE_W {target}; cannot map heat maps back '
+            f'onto the raw frame, so overlays may be misaligned.')
+        return None
+    return top, bottom, left, right
+
+
+def _project_map_to_raw(map2d, geom, raw_shape):
+    """Invert the crop+resize so a model-space heat map lands on the right
+    pixels of the raw frame. Area outside the crop gets zero - the model
+    never saw it, so it has no attribution by definition."""
+    raw_h, raw_w = raw_shape[:2]
+    top, bottom, left, right = geom
+    kept_h, kept_w = raw_h - top - bottom, raw_w - left - right
+    resized = map2d if map2d.shape[:2] == (kept_h, kept_w) \
+        else _resize_map(map2d, kept_w, kept_h)
+    out = np.zeros((raw_h, raw_w), dtype=np.float32)
+    out[top:raw_h - bottom, left:raw_w - right] = resized
+    return out
+
+
+def _dim_outside(img_arr, geom, factor=0.35):
+    """Darken the region the model never sees, so the overlay can't be read
+    as if the whole frame were an input."""
+    if geom is None:
+        return img_arr
+    raw_h, raw_w = img_arr.shape[:2]
+    top, bottom, left, right = geom
+    out = (img_arr.astype(np.float32) * factor)
+    out[top:raw_h - bottom, left:raw_w - right] = \
+        img_arr[top:raw_h - bottom, left:raw_w - right]
+    return out.astype(np.uint8)
 
 
 def _collect_variances(records, model_path, cfg, num_passes, alpha,
@@ -475,7 +584,7 @@ def _collect_tta(records, model_path, cfg, calib, progress_callback=None):
 def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                 top_k=50, percentile=None, analyze_all=False, limit=None,
                 start=None, export_frames=False, ig_steps=32,
-                progress_callback=None):
+                progress_callback=None, verify_preprocessing=True):
     """
     Run the full Feature 3 pipeline on one tub. Returns the data.json dict.
 
@@ -494,6 +603,19 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
                               ('variance', 'novelty', 'gradcam'). Used by the
                               GUI launcher (``donkeycar.parts.uncertainty_viewer``)
                               to show live progress; harmless to omit for CLI use.
+    :param verify_preprocessing: raise if ``cfg``'s TRANSFORMATIONS /
+                              POST_TRANSFORMATIONS / ROI_CROP_* / LANE_ISOLATE_*
+                              don't match what ``model_path`` was actually
+                              trained with (per its ``.preprocessing.json``
+                              sidecar). ``cfg`` here comes from ``--config``
+                              (CLI) or the launcher's config, and nothing
+                              otherwise ties it to the model being analysed --
+                              every heat map and the ``model_input`` layer
+                              would be silently computed on the wrong pixels.
+                              Set False only when the caller has deliberately
+                              chosen a different pipeline than the model was
+                              trained with (e.g. the launcher's transformations
+                              override) and knows that.
     """
     from donkeycar.parts.keras import KerasLinear
     from donkeycar.parts.mc_calibrate import (default_calib_path,
@@ -513,6 +635,12 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
     # surfaces later as an unreadable Keras shape error mid-forward-pass.
     from donkeycar.parts.mc_calibrate import check_model_image_size
     check_model_image_size(model_path, cfg)
+
+    if verify_preprocessing:
+        from donkeycar.parts.image_transformations import \
+            check_preprocessing_metadata
+        check_preprocessing_metadata(
+            cfg, model_path, context="this analysis's config")
 
     dataset = TubDataset(config=cfg, tub_paths=[tub_path])
     records = dataset.get_records()
@@ -661,53 +789,86 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
 
     frames = {}
     to_model = _model_input_processor(cfg)
+    geom = None            # crop box in raw coords; resolved on frame 1
+    geom_resolved = False
     for n, i in enumerate(sorted(selected)):
         record = records[i]
         # Two images per frame, on purpose:
-        #   disp  -- the raw camera frame, what a human recognises. Everything
-        #            saved to disk is drawn on this.
+        #   disp  -- the raw camera frame, what a human recognises.
         #   img   -- what the model is actually fed (transformed). Every
         #            gradient/attribution is computed against this, or it
         #            would be explaining behaviour on input the model never
         #            sees while driving.
-        # Heat maps come back at img's size and are fitted to disp before
-        # overlay, which matters only if a transformation changes dimensions
-        # (mask-style CROP/TRAPEZE do not).
+        # Heat maps therefore come back in img's coordinates. When CROP is
+        # active those coordinates are NOT the raw frame's, so each map is
+        # projected back through the crop before being drawn on disp, and is
+        # also saved drawn directly on img (the '_mi' variants) where it
+        # needs no mapping at all and is exact by construction.
         disp = record.image()
         img = to_model(disp)
         idx = record.underlying.get('_index', i)
 
+        if not geom_resolved:
+            geom = _crop_geometry(cfg, disp.shape, img.shape)
+            geom_resolved = True
+            if geom:
+                logger.info(
+                    f'Heat maps will be projected back through CROP '
+                    f'{geom} (top, bottom, left, right) onto the raw frame.')
+
+        model_view = _as_displayable(img)
+        # Only worth a second copy of every map when the geometry actually
+        # differs; otherwise the two overlays would be identical images.
+        want_mi = geom is not None
+        raw_base = _dim_outside(disp, geom)
+
+        def save_map(map_model_space, suffix, key, entry):
+            """Save one heat map twice: projected onto the raw frame, and
+            drawn directly on the model input."""
+            raw_map = (_project_map_to_raw(map_model_space, geom, disp.shape)
+                       if geom is not None
+                       else _fit_map_to(map_model_space, disp))
+            name = f'{idx:06d}_{suffix}.png'
+            Image.fromarray(overlay_heatmap(raw_base, raw_map)).save(
+                os.path.join(images_dir, name))
+            entry[key] = f'images/{name}'
+            if want_mi:
+                mi_map = _fit_map_to(map_model_space, model_view)
+                mi_name = f'{idx:06d}_{suffix}_mi.png'
+                Image.fromarray(overlay_heatmap(model_view, mi_map)).save(
+                    os.path.join(images_dir, mi_name))
+                entry[key + '_mi'] = f'images/{mi_name}'
+
         mean_map, var_map, raw_peak = engine.uncertainty_map(img)
-        mean_map = _fit_map_to(mean_map, disp)
-        var_map = _fit_map_to(var_map, disp)
         orig_name = f'{idx:06d}_orig.jpg'
-        unc_name = f'{idx:06d}_unc.png'
-        attn_name = f'{idx:06d}_attn.png'
         Image.fromarray(disp).save(os.path.join(images_dir, orig_name))
-        Image.fromarray(overlay_heatmap(disp, var_map)).save(
-            os.path.join(images_dir, unc_name))
-        Image.fromarray(overlay_heatmap(disp, mean_map)).save(
-            os.path.join(images_dir, attn_name))
 
         frame_entry = {
             'orig': f'images/{orig_name}',
-            'overlay': f'images/{unc_name}',
-            'attention': f'images/{attn_name}',
             'variance': float(variances[i]),
             'confidence': conf(variances[i]),
             'attention_variance_peak': raw_peak,
         }
+        save_map(var_map, 'unc', 'overlay', frame_entry)
+        save_map(mean_map, 'attn', 'attention', frame_entry)
+
+        # The model input itself, saved whenever it differs from the raw
+        # frame, so the transformation pipeline can be eyeballed directly.
+        if _model_input_differs(img, disp):
+            model_input_name = f'{idx:06d}_model_input.jpg'
+            Image.fromarray(model_view).save(
+                os.path.join(images_dir, model_input_name))
+            frame_entry['model_input'] = f'images/{model_input_name}'
 
         # Grad-CAM++ attention (sharper, multi-region variant of 'attention').
-        attnpp_map = _fit_map_to(engine.attention_pp_map(img), disp)
-        attnpp_name = f'{idx:06d}_attnpp.png'
-        Image.fromarray(overlay_heatmap(disp, attnpp_map)).save(
-            os.path.join(images_dir, attnpp_name))
-        frame_entry['attention_pp'] = f'images/{attnpp_name}'
+        save_map(engine.attention_pp_map(img), 'attnpp', 'attention_pp',
+                 frame_entry)
 
         if novelty_spatial is not None:
             # RAW frame: novelty is measured on untransformed pixels, matching
-            # the live detector and the timeline's novelty %.
+            # the live detector and the timeline's novelty %. Its map is
+            # therefore already in raw coordinates - it must NOT be projected,
+            # and there is no model-input variant to show.
             nov_map, nov_peak = engine.novelty_map(
                 disp, ns_mean, ns_var, ns_active, ns_eps,
                 extractor=ns_extractor)
@@ -719,18 +880,11 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
             frame_entry['novelty_map_peak'] = nov_peak
 
         norm_img = normalize_image(img).astype(np.float32)
-        sal_map = _fit_map_to(saliency_engine.saliency_map(norm_img), disp)
-        sal_name = f'{idx:06d}_saliency.png'
-        Image.fromarray(overlay_heatmap(disp, sal_map)).save(
-            os.path.join(images_dir, sal_name))
-        frame_entry['saliency'] = f'images/{sal_name}'
-
+        save_map(saliency_engine.saliency_map(norm_img), 'saliency',
+                 'saliency', frame_entry)
         # Integrated Gradients: cleaner, axiomatic pixel attribution.
-        ig_map = _fit_map_to(ig_engine.saliency_map(norm_img), disp)
-        ig_name = f'{idx:06d}_ig.png'
-        Image.fromarray(overlay_heatmap(disp, ig_map)).save(
-            os.path.join(images_dir, ig_name))
-        frame_entry['integrated_gradients'] = f'images/{ig_name}'
+        save_map(ig_engine.saliency_map(norm_img), 'ig',
+                 'integrated_gradients', frame_entry)
 
         frames[str(idx)] = frame_entry
         if (n + 1) % 10 == 0:
@@ -746,6 +900,13 @@ def analyze_tub(cfg, tub_path, model_path, out_dir, num_passes=15, alpha=0.2,
         'n_records': len(records),
         'n_analyzed': len(selected),
         'frames_exported': bool(export_frames),
+        # True when TRANSFORMATIONS change the geometry, so heat maps were
+        # projected back through the crop for the raw-frame overlays and a
+        # '<layer>_mi' variant drawn on the model input also exists.
+        'model_input_available': geom is not None,
+        'crop_geometry': (
+            {'top': geom[0], 'bottom': geom[1],
+             'left': geom[2], 'right': geom[3]} if geom else None),
         'created': time.strftime('%Y-%m-%d %H:%M:%S'),
         'note': ('Attention-variance maps from MC-Dropout Grad-CAM. '
                  'Relative per-model signal, not a calibrated probability.'),
