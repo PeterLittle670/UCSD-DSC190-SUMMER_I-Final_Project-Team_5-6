@@ -305,6 +305,14 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
     # load and configure model for inference
     #
     if model_path:
+        # Deterministic transforms (crop, trapezoidal mask, etc.) must be
+        # identical between training and driving, or the model looks at a
+        # different kind of input than it was trained on - stop startup
+        # rather than silently drive with mismatched preprocessing.
+        from donkeycar.parts.image_transformations import \
+            check_preprocessing_metadata
+        check_preprocessing_metadata(cfg, model_path)
+
         # If we have a model, create an appropriate Keras part
         kl = dk.utils.get_model_by_type(model_type, cfg)
 
@@ -402,11 +410,13 @@ def drive(cfg, model_path=None, use_joystick=False, model_type=None,
         # so they get applied at inference time in autopilot mode.
         #
         if hasattr(cfg, 'TRANSFORMATIONS') or hasattr(cfg, 'POST_TRANSFORMATIONS'):
-            from donkeycar.parts.image_transformations import ImageTransformations
+            from donkeycar.parts.image_transformations import \
+                ImageTransformations, log_preprocessing_config
             #
             # add the complete set of pre and post augmentation transformations
             #
             logger.info(f"Adding inference transformations")
+            log_preprocessing_config(cfg, 'vehicle')
             V.add(ImageTransformations(cfg, 'TRANSFORMATIONS',
                                        'POST_TRANSFORMATIONS'),
                   inputs=['cam/image_array'], outputs=['cam/image_array_trans'])

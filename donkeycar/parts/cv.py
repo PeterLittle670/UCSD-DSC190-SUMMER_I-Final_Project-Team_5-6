@@ -637,6 +637,61 @@ class ImgCropMask:
         self.masks = {}  # free cached masks
 
 
+class ImgCropResize:
+    """
+    Apply a true crop to top/bottom/left/right of an image, then resize the
+    remaining region back to (target_width, target_height).
+
+    Unlike ImgCropMask, which keeps the original image dimensions and paints
+    the excluded border with a fill color, this physically removes the
+    excluded rows/columns - there is no masked-out region, no fill color and
+    no hard black/image boundary in the output. The output is always exactly
+    (target_height, target_width, depth) when a target size is given.
+    """
+
+    def __init__(self, left=0, top=0, right=0, bottom=0,
+                target_width=None, target_height=None) -> None:
+        self.left = left or 0
+        self.top = top or 0
+        self.right = right or 0
+        self.bottom = bottom or 0
+        if self.left < 0 or self.top < 0 or self.right < 0 or self.bottom < 0:
+            raise ValueError(
+                f"ImgCropResize: crop margins must be >= 0, got "
+                f"left={self.left}, top={self.top}, right={self.right}, "
+                f"bottom={self.bottom}")
+        self.target_width = target_width
+        self.target_height = target_height
+        self._resize = None
+        if target_width is not None and target_height is not None:
+            # Reuse the resize convention already used elsewhere in the
+            # codebase rather than a second, inconsistent implementation.
+            self._resize = ImageResize(target_width, target_height)
+
+    def run(self, image):
+        if image is None:
+            return None
+
+        height, width, depth = image_shape(image)
+        top, bottom = self.top, height - self.bottom
+        left, right = self.left, width - self.right
+
+        if bottom <= top or right <= left:
+            raise ValueError(
+                f"ImgCropResize: crop values produce an empty image for "
+                f"input shape {image.shape} (left={self.left}, "
+                f"top={self.top}, right={self.right}, bottom={self.bottom} "
+                f"-> rows [{top}:{bottom}], cols [{left}:{right}])")
+
+        cropped = image[top:bottom, left:right]
+        if self._resize is None:
+            return cropped
+        return self._resize.run(cropped)
+
+    def shutdown(self):
+        pass
+
+
 class ArrowKeyboardControls:
     '''
     kind of sucky control, only one press active at a time. 

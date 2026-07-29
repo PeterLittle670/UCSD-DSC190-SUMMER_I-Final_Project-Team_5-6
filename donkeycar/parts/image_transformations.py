@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 from typing import List
 from donkeycar.config import Config
 from donkeycar.parts import cv as cv_parts
@@ -31,6 +33,120 @@ class ImageTransformations:
         return image
 
 
+def _pipeline_steps(cfg, include_augmentations=False):
+    """
+    Return the ordered list of pipeline step names actually executed by
+    donkeycar.pipeline.training.BatchSequence.image_processor -
+    TRANSFORMATIONS, then AUGMENTATIONS (training only), then
+    POST_TRANSFORMATIONS - so logging/metadata always reflect the real
+    execution order rather than the raw config attributes.
+    """
+    steps = list(getattr(cfg, 'TRANSFORMATIONS', []) or [])
+    if include_augmentations:
+        steps += list(getattr(cfg, 'AUGMENTATIONS', []) or [])
+    steps += list(getattr(cfg, 'POST_TRANSFORMATIONS', []) or [])
+    return steps
+
+
+def log_preprocessing_config(cfg, context: str, include_augmentations=False):
+    """
+    Print the resolved image size, transformation/augmentation config and
+    the actual ordered pipeline for a given context ('training',
+    'validation' or 'vehicle'), so a train/inference preprocessing mismatch
+    shows up in the logs instead of only as bad driving behaviour.
+    """
+    logger.info(
+        f"[{context}] IMAGE_W={getattr(cfg, 'IMAGE_W', None)} "
+        f"IMAGE_H={getattr(cfg, 'IMAGE_H', None)} "
+        f"TRANSFORMATIONS={getattr(cfg, 'TRANSFORMATIONS', [])} "
+        f"POST_TRANSFORMATIONS={getattr(cfg, 'POST_TRANSFORMATIONS', [])} "
+        f"ROI_CROP_TOP={getattr(cfg, 'ROI_CROP_TOP', None)} "
+        f"ROI_CROP_BOTTOM={getattr(cfg, 'ROI_CROP_BOTTOM', None)} "
+        f"ROI_CROP_LEFT={getattr(cfg, 'ROI_CROP_LEFT', None)} "
+        f"ROI_CROP_RIGHT={getattr(cfg, 'ROI_CROP_RIGHT', None)}")
+    steps = ['Raw Image'] + \
+        _pipeline_steps(cfg, include_augmentations) + ['Model']
+    logger.info(f"[{context}] pipeline: {' -> '.join(steps)}")
+
+
+def build_preprocessing_metadata(cfg) -> dict:
+    """
+    Snapshot of the preprocessing settings that must be identical between
+    training and driving. Used both as the sidecar json saved next to a
+    trained model and as the "current config" side of the comparison done
+    by check_preprocessing_metadata() before the vehicle starts driving.
+    """
+    crop_active = 'CROP' in _pipeline_steps(cfg, include_augmentations=False)
+    return {
+        "image_width": getattr(cfg, 'IMAGE_W', None),
+        "image_height": getattr(cfg, 'IMAGE_H', None),
+        "transformations": ["CROP_RESIZE"] if crop_active else [],
+        "augmentation_order": (["random_augmentations", "crop_resize"]
+                               if crop_active else ["random_augmentations"]),
+        "roi_crop_top": getattr(cfg, 'ROI_CROP_TOP', 0) if crop_active else 0,
+        "roi_crop_bottom": getattr(cfg, 'ROI_CROP_BOTTOM', 0)
+                           if crop_active else 0,
+        "roi_crop_left": getattr(cfg, 'ROI_CROP_LEFT', 0)
+                         if crop_active else 0,
+        "roi_crop_right": getattr(cfg, 'ROI_CROP_RIGHT', 0)
+                          if crop_active else 0,
+        "resize_width": getattr(cfg, 'IMAGE_W', None),
+        "resize_height": getattr(cfg, 'IMAGE_H', None),
+        "crop_mode": "physical_crop_and_resize" if crop_active else "none",
+    }
+
+
+def _sidecar_path_for(model_path: str) -> str:
+    base, _ext = os.path.splitext(model_path)
+    return base + ".preprocessing.json"
+
+
+def save_preprocessing_metadata(cfg, model_path: str) -> str:
+    """ Write the resolved preprocessing metadata next to a just-trained
+        model, e.g. models/mypilot.h5 -> models/mypilot.preprocessing.json """
+    sidecar_path = _sidecar_path_for(model_path)
+    with open(sidecar_path, 'w') as f:
+        json.dump(build_preprocessing_metadata(cfg), f, indent=2)
+    logger.info(f"Saved preprocessing metadata to {sidecar_path}")
+    return sidecar_path
+
+
+def check_preprocessing_metadata(cfg, model_path: str) -> None:
+    """
+    Compare model_path's preprocessing sidecar (if any) against the current
+    vehicle config. Raises RuntimeError describing every mismatched field if
+    any differ, so a stale/mismatched crop or resolution setting stops the
+    vehicle from starting instead of silently driving badly. If no sidecar
+    exists (e.g. a model trained before this check existed), this only logs
+    a warning and continues.
+    """
+    sidecar_path = _sidecar_path_for(model_path)
+    if not os.path.exists(sidecar_path):
+        logger.warning(
+            f"No preprocessing metadata found at {sidecar_path} - cannot "
+            f"verify that {model_path} matches this vehicle's TRANSFORMATIONS"
+            f"/POST_TRANSFORMATIONS/ROI_CROP_* configuration.")
+        return
+
+    with open(sidecar_path) as f:
+        saved = json.load(f)
+    current = build_preprocessing_metadata(cfg)
+
+    mismatches = [
+        f"  {key}: model was trained with {saved.get(key)!r}, "
+        f"current vehicle config has {current.get(key)!r}"
+        for key in current if saved.get(key) != current.get(key)
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "Preprocessing mismatch between the trained model "
+            f"({sidecar_path}) and this vehicle's configuration:\n" +
+            "\n".join(mismatches) +
+            "\nRefusing to start - retrain the model with this vehicle's "
+            "configuration, or update the vehicle's config to match the "
+            "model.")
+
+
 def image_transformer(name: str, config):
     """
     Factory for cv image transformation parts.
@@ -60,11 +176,13 @@ def image_transformer(name: str, config):
             config.ROI_TRAPEZE_MAX_Y
         )
     elif "CROP" == name:
-        return cv_parts.ImgCropMask(
-            config.ROI_CROP_LEFT,
-            config.ROI_CROP_TOP,
-            config.ROI_CROP_RIGHT,
-            config.ROI_CROP_BOTTOM
+        return cv_parts.ImgCropResize(
+            left=config.ROI_CROP_LEFT,
+            top=config.ROI_CROP_TOP,
+            right=config.ROI_CROP_RIGHT,
+            bottom=config.ROI_CROP_BOTTOM,
+            target_width=config.IMAGE_W,
+            target_height=config.IMAGE_H
         )
     #
     # color space transformations
@@ -286,7 +404,10 @@ def img_transform_from_json(transform_config):
     if "TRAPEZE_EDGE" == transformation:
         transformer = cv_parts.ImgTrapezoidalEdgeMask(**args)
     elif 'CROP' == transformation:
-        transformer = cv_parts.ImgCropMask(**args)
+        # Physically crops (and, if target_width/target_height are given,
+        # resizes) rather than masking - see ImgCropResize vs the older
+        # ImgCropMask in donkeycar/parts/cv.py.
+        transformer = cv_parts.ImgCropResize(**args)
 
     #
     # color space transformations

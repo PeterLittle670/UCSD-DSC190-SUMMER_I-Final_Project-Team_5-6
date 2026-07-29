@@ -14,7 +14,8 @@ from donkeycar.pipeline.database import PilotDatabase
 from donkeycar.pipeline.sequence import TubRecord, TubSequence, TfmIterator
 from donkeycar.pipeline.types import TubDataset
 from donkeycar.pipeline.augmentations import ImageAugmentation
-from donkeycar.parts.image_transformations import ImageTransformations
+from donkeycar.parts.image_transformations import ImageTransformations, \
+    log_preprocessing_config, save_preprocessing_metadata
 from donkeycar.utils import get_model_by_type, normalize_image, train_test_split
 import tensorflow as tf
 import numpy as np
@@ -42,6 +43,9 @@ class BatchSequence(object):
         self.transformation = ImageTransformations(config, 'TRANSFORMATIONS')
         self.post_transformation = ImageTransformations(config,
                                                         'POST_TRANSFORMATIONS')
+        log_preprocessing_config(config,
+                                 'training' if is_train else 'validation',
+                                 include_augmentations=is_train)
         self.pipeline = self._create_pipeline()
 
     def __len__(self) -> int:
@@ -165,6 +169,10 @@ def train(cfg: Config, tub_paths: str, model: str = None,
                        min_delta=cfg.MIN_DELTA,
                        patience=cfg.EARLY_STOP_PATIENCE,
                        show_plot=cfg.SHOW_PLOT)
+
+    # Record the exact preprocessing this model was trained with, so the
+    # vehicle can refuse to drive it if its own config doesn't match.
+    save_preprocessing_metadata(cfg, model_path)
 
     # We are doing the tflite/trt conversion here on a previously saved model
     # and not on the kl.interpreter.model object directly. The reason is that

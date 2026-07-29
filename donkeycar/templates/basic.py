@@ -19,7 +19,8 @@ from donkeycar.parts.tub_v2 import TubWriter, TubWiper
 from donkeycar.parts.datastore import TubHandler
 from donkeycar.parts.controller import LocalWebController, RCReceiver
 from donkeycar.parts.actuator import PCA9685, PWMSteering, PWMThrottle
-from donkeycar.pipeline.augmentations import ImageAugmentation
+from donkeycar.parts.image_transformations import ImageTransformations, \
+    log_preprocessing_config, check_preprocessing_metadata
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -145,13 +146,23 @@ def drive(cfg, model_path=None, model_type=None):
     if model_type is None:
         model_type = cfg.DEFAULT_MODEL_TYPE
     if model_path:
+        # Deterministic transforms (crop, trapezoidal mask, etc.) must be
+        # identical between training and driving, or the model looks at a
+        # different kind of input than it was trained on - see
+        # check_preprocessing_metadata() below.
+        check_preprocessing_metadata(cfg, model_path)
         kl = dk.utils.get_model_by_type(model_type, cfg)
         kl.load(model_path=model_path)
         inputs = ['cam/image_array']
-        # Add image transformations like crop or trapezoidal mask
-        if hasattr(cfg, 'TRANSFORMATIONS') and cfg.TRANSFORMATIONS:
+        # Add image transformations like crop or trapezoidal mask. These are
+        # deterministic and must run through ImageTransformations - the
+        # random-augmentation class ImageAugmentation has no CROP/TRAPEZE
+        # support and must never be used for driving.
+        if hasattr(cfg, 'TRANSFORMATIONS') or hasattr(cfg, 'POST_TRANSFORMATIONS'):
+            log_preprocessing_config(cfg, 'vehicle')
             outputs = ['cam/image_array_trans']
-            car.add(ImageAugmentation(cfg, 'TRANSFORMATIONS'),
+            car.add(ImageTransformations(cfg, 'TRANSFORMATIONS',
+                                         'POST_TRANSFORMATIONS'),
                     inputs=inputs, outputs=outputs)
             inputs = outputs
 
