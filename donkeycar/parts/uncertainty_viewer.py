@@ -169,6 +169,14 @@ class LauncherState:
             'lane_isolate_params': saved.get('lane_isolate_params'),
         }
 
+    def has_calibration(self, model_path):
+        """Whether `model_path` already has a saved `<model>.calib.json`
+        (see ``mc_calibrate.default_calib_path``), for the form's
+        auto-calibrate checkbox default."""
+        from donkeycar.parts.mc_calibrate import default_calib_path
+        return os.path.isfile(
+            default_calib_path(os.path.expanduser(model_path)))
+
     def start(self, form):
         with self._lock:
             if self._progress['running']:
@@ -405,7 +413,10 @@ class ViewerHandler(SimpleHTTPRequestHandler):
             if not model:
                 return self._send_json({'error': 'no model given'}, status=400)
             info = ViewerHandler.launcher_state.saved_pipeline_for_model(model)
-            return self._send_json(info or {'pipeline_steps': None})
+            result = info or {'pipeline_steps': None}
+            result['has_calibration'] = \
+                ViewerHandler.launcher_state.has_calibration(model)
+            return self._send_json(result)
 
         if path.startswith('/tub/'):
             if not self.tub_images_dir:
@@ -464,13 +475,9 @@ class ViewerHandler(SimpleHTTPRequestHandler):
 
 
 def _load_config(config_path):
-    import donkeycar as dk
-    if config_path is None and not os.path.exists('config.py'):
-        config_path = os.path.join(os.path.dirname(dk.__file__),
-                                   'templates', 'cfg_complete.py')
-        logger.warning(f'No ./config.py; using bundled defaults for the '
-                       f'launcher.')
-    return dk.load_config(config_path)
+    from donkeycar.parts.image_transformations import \
+        load_config_and_myconfig
+    return load_config_and_myconfig(config_path)
 
 
 def main(args=None):

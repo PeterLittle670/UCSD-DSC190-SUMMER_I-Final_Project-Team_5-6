@@ -959,12 +959,9 @@ def main(args=None):
                              'the tub present (self-contained results)')
     parsed = parser.parse_args(args)
 
-    config_path = parsed.config
-    if config_path is None and not os.path.exists('config.py'):
-        config_path = os.path.join(os.path.dirname(dk.__file__),
-                                   'templates', 'cfg_complete.py')
-        logger.warning(f'No ./config.py; using bundled defaults.')
-    cfg = dk.load_config(config_path)
+    from donkeycar.parts.image_transformations import \
+        load_config_and_myconfig
+    cfg = load_config_and_myconfig(parsed.config)
 
     num_passes = parsed.passes or getattr(cfg, 'XAI_CONFIDENCE_PASSES', 15)
     alpha = getattr(cfg, 'XAI_CONFIDENCE_ALPHA', 0.2)

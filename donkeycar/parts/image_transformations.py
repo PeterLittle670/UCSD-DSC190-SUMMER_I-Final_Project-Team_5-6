@@ -120,6 +120,76 @@ def build_preprocessing_metadata(cfg) -> dict:
     return meta
 
 
+def load_config_and_myconfig(config_path=None):
+    """
+    Load a Config the way the offline analysis tools (gradcam_uncertainty.py,
+    uncertainty_viewer.py) need it: the full set of base settings, plus this
+    project's real overrides from myconfig.py, reliably - regardless of
+    which file ``config_path`` happens to point at.
+
+    Why this exists rather than just calling donkeycar.config.load_config()
+    directly: that function's own myconfig.py lookup is a literal string
+    ``config_path.replace("config.py", "myconfig.py")`` on the WHOLE path.
+    That only works when the base file is literally named "config.py"
+    sitting next to a myconfig.py - the standard ``donkey createcar``
+    layout. It silently breaks in two cases that are completely ordinary
+    for this project, where the real base/override pair is
+    donkeycar/templates/cfg_complete.py + donkeycar/templates/myconfig.py,
+    not a repo-root config.py/myconfig.py:
+
+      1. Falling back to the bundled cfg_complete.py (no ./config.py found,
+         nothing passed via --config): "cfg_complete.py" doesn't contain the
+         substring "config.py", so the .replace() is a no-op and myconfig.py
+         is never even looked for. This is what a bare
+         ``python run_gradcam_analysis.py`` hits.
+      2. Pointing --config directly at myconfig.py: "myconfig.py" DOES
+         contain "config.py" as a substring (it's the last 9 characters), so
+         the .replace() fires and produces the nonexistent "mymyconfig.py" -
+         and myconfig.py alone lacks base settings like IMAGE_DEPTH/
+         BATCH_SIZE that only cfg_complete.py defines, so the result is an
+         incomplete config either way.
+
+    This does not touch donkeycar.config.load_config() itself, since that
+    would change behaviour for every caller (train, drive, ...) rather than
+    just the two analysis-tool entry points that actually hit this.
+    """
+    import donkeycar as dk
+
+    bundled_base = os.path.join(os.path.dirname(dk.__file__),
+                                'templates', 'cfg_complete.py')
+
+    if config_path is None and not os.path.exists('config.py'):
+        logger.warning(f'No ./config.py; using the bundled base config at '
+                       f'{bundled_base}.')
+        config_path = bundled_base
+    config_path = os.path.abspath(config_path)
+
+    if os.path.basename(config_path) == 'myconfig.py':
+        # config_path IS the overrides-only file - load the full bundled
+        # base first so IMAGE_DEPTH/BATCH_SIZE/etc aren't silently missing,
+        # then apply config_path's own content on top of it.
+        cfg = dk.load_config(bundled_base)
+        overrides = Config()
+        overrides.from_pyfile(config_path)
+        cfg.from_object(overrides)
+    else:
+        cfg = dk.load_config(config_path)
+
+    # Redo the myconfig.py sibling lookup with a real path join instead of
+    # the broken string-replace described above. In the standard config.py
+    # layout this re-applies what load_config() already merged in (harmless
+    # - from_object() is idempotent); in both cases above it's what actually
+    # makes myconfig.py's overrides take effect at all.
+    sibling = os.path.join(os.path.dirname(config_path), 'myconfig.py')
+    if os.path.isfile(sibling) and os.path.abspath(sibling) != config_path:
+        logger.info(f'Applying overrides from {sibling}')
+        overrides = Config()
+        overrides.from_pyfile(sibling)
+        cfg.from_object(overrides)
+
+    return cfg
+
+
 def _sidecar_path_for(model_path: str) -> str:
     base, _ext = os.path.splitext(model_path)
     return base + ".preprocessing.json"

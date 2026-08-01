@@ -119,24 +119,27 @@
       looks at only that span. Leave blank to use the whole tub.</div>
 
     <div class="checkbox-row" style="margin-top: 14px;">
-      <input type="checkbox" id="auto-calibrate" checked>
+      <input type="checkbox" id="auto-calibrate">
       <label for="auto-calibrate">Auto-calibrate this model first if it has no calibration yet</label>
     </div>
     <div class="hint">Needed for confidence %% / novelty %%; adds a one-time
       full-drive replay (only the first time you analyse this model &mdash;
-      later runs reuse the saved calibration).</div>
+      later runs reuse the saved calibration). Checked automatically when the
+      model above has no saved calibration yet.</div>
 
-    <label for="calib-tub" id="calib-tub-label">Calibration tub (training data)</label>
-    <input type="text" id="calib-tub" list="tubs-list"
-           placeholder="auto-detected from this model's training record, if known">
-    <div class="hint" id="calib-tub-hint">Calibration must be run against the
-      tub(s) this model was actually TRAINED on &mdash; not necessarily the
-      tub above, which is often a separate inference/test drive. Calibrating
-      against the wrong data makes confidence/novelty %% meaningless (novelty
-      would end up measuring "unlike this other drive" instead of "unlike
-      what the model learned"). Auto-filled when this model's training tub
-      is on record; edit it, or leave blank and it falls back to the tub
-      above with a visible warning.</div>
+    <div id="calib-tub-section" style="display: none; margin-top: 14px;">
+      <label for="calib-tub" id="calib-tub-label">Calibration tub (training data)</label>
+      <input type="text" id="calib-tub" list="tubs-list"
+             placeholder="auto-detected from this model's training record, if known">
+      <div class="hint" id="calib-tub-hint">Calibration must be run against the
+        tub(s) this model was actually TRAINED on &mdash; not necessarily the
+        tub above, which is often a separate inference/test drive. Calibrating
+        against the wrong data makes confidence/novelty %% meaningless (novelty
+        would end up measuring "unlike this other drive" instead of "unlike
+        what the model learned"). Auto-filled when this model's training tub
+        is on record; edit it, or leave blank and it falls back to the tub
+        above with a visible warning.</div>
+    </div>
 
     <div class="checkbox-row" style="margin-top: 14px;">
       <input type="checkbox" id="export-frames">
@@ -200,6 +203,21 @@
   let calibTubUserEdited = false;
   $('calib-tub').addEventListener('input', () => { calibTubUserEdited = true; });
 
+  // ---- auto-calibrate checkbox: default on only when the selected model
+  // has no saved calibration yet (courtesy default only -- never overwrites
+  // a value the user already toggled by hand). The "Calibration tub" field
+  // is only relevant when auto-calibrate is on, so keep it hidden otherwise.
+  let autoCalibrateUserEdited = false;
+  function updateCalibVisibility() {
+    $('calib-tub-section').style.display =
+      $('auto-calibrate').checked ? '' : 'none';
+  }
+  $('auto-calibrate').addEventListener('change', () => {
+    autoCalibrateUserEdited = true;
+    updateCalibVisibility();
+  });
+  updateCalibVisibility();
+
   function refreshTrainingTubs() {
     const model = $('model').value.trim();
     const hint = $('calib-tub-hint');
@@ -259,6 +277,10 @@
         } else {
           hint.textContent = 'Trained with no TRANSFORMATIONS/'
             + 'POST_TRANSFORMATIONS (raw camera frames).';
+        }
+        if (!autoCalibrateUserEdited && typeof d.has_calibration === 'boolean') {
+          $('auto-calibrate').checked = !d.has_calibration;
+          updateCalibVisibility();
         }
       })
       .catch(() => { hint.textContent = ''; });

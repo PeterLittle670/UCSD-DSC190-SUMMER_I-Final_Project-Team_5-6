@@ -53,7 +53,7 @@ IMAGE_H = 108
 # survive that transform looking much like lane tape, and 45 left a band of
 # them in the frame whenever the camera pitched up. Held constant across all
 # trials so augmentation and transform effects stay comparable.
-POST_TRANSFORMATIONS = ['CROP']
+POST_TRANSFORMATIONS = []
 ROI_CROP_TOP = 55
 
 # The OAK-D part returns getCvFrame(), which is BGR, and nothing converts it
