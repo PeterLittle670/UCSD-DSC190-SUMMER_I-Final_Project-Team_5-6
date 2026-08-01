@@ -133,7 +133,7 @@ The web dashboard shows three live signals per frame — "Do the model's sub-net
 ---
 
 ## Acknowledgements
-Reference to [winter-2024-final-project-team-7](https://github.com/UCSD-ECEMAE-148/winter-2024-final-project-team-7)
+README.md Format, reference to [winter-2024-final-project-team-7](https://github.com/UCSD-ECEMAE-148/winter-2024-final-project-team-7)
 
 Thank you to Professor Silberman and TAs Evan Chou and Jose Castillo for facilitating this course!
 
