@@ -54,8 +54,8 @@ Side-by-side track runs comparing the augmented model against the baseline model
 | 7/29 – 7/30 | Prepare presentation |
 
 ### Documentation
-* [Augmentations guide](augmentations.md) — usage walkthrough and technical explanation of every augmentation and transformation
-* [Lighting robustness trials](lighting_robustness_trials.md) — trial notes behind the "what didn't work" findings above
+* [Augmentations guide](docs/augmentations.md) — usage walkthrough and technical explanation of every augmentation and transformation
+* [Lighting robustness trials](docs/lighting_robustness_trials.md) — trial notes behind the "what didn't work" findings above
 
 ---
 
@@ -122,7 +122,7 @@ The web dashboard shows three live signals per frame — "Do the model's sub-net
 * **Salience source mapping:** apply mechanistic interpretability (linear probes, sparse autoencoders) to see what concepts the CNN's top filters actually encode — e.g. testing whether track-edge transitions or turn direction are linearly decodable, and pulling the highest-activating image patches for each top filter/feature.
 
 ### Documentation
-* [Explainable AI (XAI) toolkit guide](xai.md) — usage walkthrough (recording, calibration, live dashboard, offline viewer) and a technical deep-dive into how each signal works
+* [Explainable AI (XAI) toolkit guide](docs/xai.md) — usage walkthrough (recording, calibration, live dashboard, offline viewer) and a technical deep-dive into how each signal works
 
 ---
 
