@@ -128,7 +128,7 @@ The web dashboard shows three live signals per frame — "Do the model's sub-net
 
 ## Final Project Videos / Presentation
 
-[![Presentation slides](docs/slides_thumbnail.png)](https://drive.google.com/file/d/YOUR_FILE_ID/view?usp=sharing)
+[![Presentation slides](docs/slides_thumbnail.png)](https://docs.google.com/presentation/d/1pt5OJfPrH0suxoJ4y6KRCdK32uakrAbemNvmKHkS6AM/edit?usp=sharing)
 
 ---
 
