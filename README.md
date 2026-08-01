@@ -7,7 +7,7 @@ Team #5+6, Summer 2026
 ## Team Members
 Yash Tandon - B.S. Data Science, B.S. Cognitive Science w/ Specialization in Machine Learning and Neural Computation
 
-Peter Little
+Peter Little - B.S. Data Science, Minor in Cognitive Science
 
 Kaitlyn Tam
 
@@ -145,6 +145,6 @@ Thank you to Professor Silberman and TAs Evan Chou, Jose Castillo and Abdulaziz 
 ## Contacts
 
 * Yash Tandon - [ytandon@ucsd.edu](mailto:ytandon@ucsd.edu) | [LinkedIn](https://linkedin.com/in/yashtandon05)
-* Peter Little -
+* Peter Little - [pjlittle@ucsd.edu](mailto:pjlittle@ucsd.edu) | [LinkedIn](https://www.linkedin.com/in/peter-little-83588935a/)
 * Kaitlyn Tam - 
 * Jacey Chow -
